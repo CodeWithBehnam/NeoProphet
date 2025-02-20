@@ -88,10 +88,10 @@ data {
   int T;                // Number of time periods
   int<lower=1> K;       // Number of regressors
   vector[T] t;          // Time
-  vector[T] cap;        // Capacities for logistic trend
+  vector[T] cap;        // Capacities for logistic trend (must be positive when trend_indicator == 1)
   vector[T] y;          // Time series
   int S;                // Number of changepoints
-  vector[S] t_change;   // Times of trend changepoints
+  vector[S] t_change;   // Times of trend changepoints (assumed sorted)
   matrix[T,K] X;        // Regressors
   vector[K] sigmas;     // Scale on seasonality prior
   real<lower=0> tau;    // Scale on changepoints prior
