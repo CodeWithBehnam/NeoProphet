@@ -79,7 +79,9 @@ class TestSerialize:
             prior_scale=2.0,
             condition_name="is_conditional_week",
         )
-        m.add_seasonality(name="normal_monthly", period=30.5, fourier_order=5, prior_scale=2.0)
+        m.add_seasonality(
+            name="normal_monthly", period=30.5, fourier_order=5, prior_scale=2.0
+        )
         df = daily_univariate_ts.copy()
         df["is_conditional_week"] = [0] * 255 + [1] * 255
         m.add_regressor("binary_feature", prior_scale=0.2)

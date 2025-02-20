@@ -33,27 +33,29 @@ try:
 except ImportError:
     pass
 
+
 @diagnostics.register_performance_metric
 def mase(df, w):
     """Mean absolute scale error
 
-        Parameters
-        ----------
-        df: Cross-validation results dataframe.
-        w: Aggregation window size.
+    Parameters
+    ----------
+    df: Cross-validation results dataframe.
+    w: Aggregation window size.
 
-        Returns
-        -------
-        Dataframe with columns horizon and mase.
+    Returns
+    -------
+    Dataframe with columns horizon and mase.
     """
-    e = (df['y'] - df['yhat'])
-    d = np.abs(np.diff(df['y'])).sum()/(df['y'].shape[0]-1)
-    se = np.abs(e/d)
+    e = df["y"] - df["yhat"]
+    d = np.abs(np.diff(df["y"])).sum() / (df["y"].shape[0] - 1)
+    se = np.abs(e / d)
     if w < 0:
-        return pd.DataFrame({'horizon': df['horizon'], 'mase': se})
+        return pd.DataFrame({"horizon": df["horizon"], "mase": se})
     return diagnostics.rolling_mean_by_h(
-        x=se.values, h=df['horizon'].values, w=w, name='mase'
+        x=se.values, h=df["horizon"].values, w=w, name="mase"
     )
+
 
 class TestCrossValidation:
     @pytest.mark.parametrize("parallel_method", PARALLEL_METHODS)
@@ -65,7 +67,11 @@ class TestCrossValidation:
         period = pd.Timedelta("10 days")
         initial = pd.Timedelta("115 days")
         df_cv = diagnostics.cross_validation(
-            m, horizon="4 days", period="10 days", initial="115 days", parallel=parallel_method
+            m,
+            horizon="4 days",
+            period="10 days",
+            initial="115 days",
+            parallel=parallel_method,
         )
         assert len(np.unique(df_cv["cutoff"])) == 3
         assert max(df_cv["ds"] - df_cv["cutoff"]) == horizon
@@ -82,7 +88,9 @@ class TestCrossValidation:
         )
         assert len(np.unique(df_cv["cutoff"])) == 1
         with pytest.raises(ValueError):
-            diagnostics.cross_validation(m, horizon="10 days", period="10 days", initial="140 days")
+            diagnostics.cross_validation(
+                m, horizon="10 days", period="10 days", initial="140 days"
+            )
 
     def test_bad_parallel_methods(self, ts_short, backend):
         m = Prophet(stan_backend=backend)
@@ -94,7 +102,9 @@ class TestCrossValidation:
         with pytest.raises(ValueError, match="'parallel' should be one"):
             diagnostics.cross_validation(m, horizon="4 days", parallel=object())
 
-    def test_check_single_cutoff_forecast_func_calls(self, ts_short, monkeypatch, backend):
+    def test_check_single_cutoff_forecast_func_calls(
+        self, ts_short, monkeypatch, backend
+    ):
         m = Prophet(stan_backend=backend)
         m.fit(ts_short)
 
@@ -122,9 +132,11 @@ class TestCrossValidation:
             _ = diagnostics.cross_validation(m, *args)
             # check single forecast function called expected number of times
             assert n_calls == forecasts
-    
+
     @pytest.mark.parametrize("extra_output_columns", ["trend", ["trend"]])
-    def test_check_extra_output_columns_cross_validation(self, ts_short, backend, extra_output_columns):
+    def test_check_extra_output_columns_cross_validation(
+        self, ts_short, backend, extra_output_columns
+    ):
         m = Prophet(stan_backend=backend)
         m.fit(ts_short)
         df_cv = diagnostics.cross_validation(
@@ -132,7 +144,7 @@ class TestCrossValidation:
             horizon="1 days",
             period="1 days",
             initial="140 days",
-            extra_output_columns=extra_output_columns
+            extra_output_columns=extra_output_columns,
         )
         assert "trend" in df_cv.columns
 
@@ -254,7 +266,7 @@ class TestPerformanceMetrics:
             df_cv,
             metrics=["coverage", "mse", "mase"],
         )
-        assert set(df_horizon.columns) == {"coverage", "mse", "mase","horizon"}
+        assert set(df_horizon.columns) == {"coverage", "mse", "mase", "horizon"}
         # Skip MAPE
         df_cv.loc[0, "y"] = 0.0
         df_horizon = diagnostics.performance_metrics(
@@ -268,7 +280,15 @@ class TestPerformanceMetrics:
         df_horizon = diagnostics.performance_metrics(
             df_cv,
         )
-        assert set(df_horizon.columns) == {"coverage", "horizon", "mae", "mdape", "mse", "rmse", "smape"}
+        assert set(df_horizon.columns) == {
+            "coverage",
+            "horizon",
+            "mae",
+            "mdape",
+            "mse",
+            "rmse",
+            "smape",
+        }
         df_horizon = diagnostics.performance_metrics(
             df_cv,
             metrics=["mape"],

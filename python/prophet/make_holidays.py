@@ -63,7 +63,9 @@ def make_holidays_df(year_list, country, province=None, state=None):
     to 'holidays' params in Prophet
     """
     country_holidays = get_country_holidays_class(country)
-    holidays = country_holidays(expand=False, language="en_US", subdiv=province, years=year_list)
+    holidays = country_holidays(
+        expand=False, language="en_US", subdiv=province, years=year_list
+    )
 
     holidays_df = pd.DataFrame(
         [(date, holidays.get_list(date)) for date in holidays],

@@ -25,7 +25,7 @@ class TestProphetFitPredictDefault:
     @pytest.mark.parametrize(
         "scaling,expected",
         [("absmax", 10.64), ("minmax", 11.13)],
-        ids=["absmax", "minmax"]
+        ids=["absmax", "minmax"],
     )
     def test_fit_predict(self, daily_univariate_ts, backend, scaling, expected):
         test_days = 30
@@ -37,12 +37,14 @@ class TestProphetFitPredictDefault:
         future = forecaster.predict(future)
         res = rmse(future["yhat"], test["y"])
         # Higher threshold due to cmdstan 2.33.1 producing numerical differences for macOS Intel (ARM is fine).
-        assert res == pytest.approx(expected, 0.1), "backend: {}".format(forecaster.stan_backend)
+        assert res == pytest.approx(expected, 0.1), "backend: {}".format(
+            forecaster.stan_backend
+        )
 
     @pytest.mark.parametrize(
         "scaling,expected",
         [("absmax", 23.44), ("minmax", 11.29)],
-        ids=["absmax", "minmax"]
+        ids=["absmax", "minmax"],
     )
     def test_fit_predict_newton(self, daily_univariate_ts, backend, scaling, expected):
         test_days = 30
@@ -53,14 +55,18 @@ class TestProphetFitPredictDefault:
         future = forecaster.make_future_dataframe(test_days, include_history=False)
         future = forecaster.predict(future)
         res = rmse(future["yhat"], test["y"])
-        assert res == pytest.approx(expected, 0.01), "backend: {}".format(forecaster.stan_backend)
+        assert res == pytest.approx(expected, 0.01), "backend: {}".format(
+            forecaster.stan_backend
+        )
 
     @pytest.mark.parametrize(
         "scaling,expected",
         [("absmax", 127.01), ("minmax", 93.45)],
-        ids=["absmax", "minmax"]
+        ids=["absmax", "minmax"],
     )
-    def test_fit_predict_large_numbers(self, large_numbers_ts, backend, scaling, expected):
+    def test_fit_predict_large_numbers(
+        self, large_numbers_ts, backend, scaling, expected
+    ):
         test_days = 30
         train, test = train_test_split(large_numbers_ts, test_days)
         forecaster = Prophet(stan_backend=backend, scaling=scaling)
@@ -69,7 +75,9 @@ class TestProphetFitPredictDefault:
         future = forecaster.make_future_dataframe(test_days, include_history=False)
         future = forecaster.predict(future)
         res = rmse(future["yhat"], test["y"])
-        assert res == pytest.approx(expected, 0.01), "backend: {}".format(forecaster.stan_backend)
+        assert res == pytest.approx(expected, 0.01), "backend: {}".format(
+            forecaster.stan_backend
+        )
 
     @pytest.mark.slow
     def test_fit_predict_sampling(self, daily_univariate_ts, backend):
@@ -117,7 +125,8 @@ class TestProphetFitPredictDefault:
 
     def test_fit_changepoint_not_in_history(self, daily_univariate_ts, backend):
         train = daily_univariate_ts[
-            (daily_univariate_ts["ds"] < "2013-01-01") | (daily_univariate_ts["ds"] > "2014-01-01")
+            (daily_univariate_ts["ds"] < "2013-01-01")
+            | (daily_univariate_ts["ds"] > "2014-01-01")
         ]
         future = pd.DataFrame({"ds": daily_univariate_ts["ds"]})
         prophet = Prophet(changepoints=["2013-06-06"], stan_backend=backend)
@@ -133,7 +142,9 @@ class TestProphetFitPredictDefault:
         The model essentially sees this as multiple observations for the same time value, and fits the parameters
         accordingly.
         """
-        train, test = train_test_split(daily_univariate_ts, daily_univariate_ts.shape[0] // 2)
+        train, test = train_test_split(
+            daily_univariate_ts, daily_univariate_ts.shape[0] // 2
+        )
         repeated_obs = train.copy()
         repeated_obs["y"] += 10
         train = pd.concat([train, repeated_obs])
@@ -146,7 +157,9 @@ class TestProphetFitPredictDefault:
         When the training data history is constant, Prophet should predict the same value for all future dates.
         """
         for constant in [0, 20]:
-            train, test = train_test_split(daily_univariate_ts, daily_univariate_ts.shape[0] // 2)
+            train, test = train_test_split(
+                daily_univariate_ts, daily_univariate_ts.shape[0] // 2
+            )
             train["y"] = constant
             forecaster = Prophet(stan_backend=backend)
             forecaster.fit(train)
@@ -174,7 +187,9 @@ class TestProphetFitPredictDefault:
 class TestProphetDataPrep:
     def test_setup_dataframe(self, daily_univariate_ts, backend):
         """Test that the columns 't' and 'y_scaled' are added to the dataframe."""
-        train, _ = train_test_split(daily_univariate_ts, daily_univariate_ts.shape[0] // 2)
+        train, _ = train_test_split(
+            daily_univariate_ts, daily_univariate_ts.shape[0] // 2
+        )
         m = Prophet(stan_backend=backend)
         history = m.setup_dataframe(train, initialize_scales=True)
 
@@ -187,7 +202,9 @@ class TestProphetDataPrep:
 
     def test_setup_dataframe_ds_column(self, daily_univariate_ts, backend):
         """Test case where 'ds' exists as an index name and column. Prophet should use the column."""
-        train, _ = train_test_split(daily_univariate_ts, daily_univariate_ts.shape[0] // 2)
+        train, _ = train_test_split(
+            daily_univariate_ts, daily_univariate_ts.shape[0] // 2
+        )
         train.index = pd.to_datetime(["1970-01-01" for _ in range(train.shape[0])])
         train.index.rename("ds", inplace=True)
         m = Prophet(stan_backend=backend)
@@ -196,7 +213,9 @@ class TestProphetDataPrep:
 
     def test_logistic_floor(self, daily_univariate_ts, backend):
         """Test the scaling of y with logistic growth and a floor/cap."""
-        train, _ = train_test_split(daily_univariate_ts, daily_univariate_ts.shape[0] // 2)
+        train, _ = train_test_split(
+            daily_univariate_ts, daily_univariate_ts.shape[0] // 2
+        )
         train["floor"] = 10.0
         train["cap"] = 80.0
         m = Prophet(growth="logistic", stan_backend=backend)
@@ -212,7 +231,9 @@ class TestProphetDataPrep:
 
     def test_logistic_floor_minmax(self, daily_univariate_ts, backend):
         """Test the scaling of y with logistic growth and a floor/cap."""
-        train, _ = train_test_split(daily_univariate_ts, daily_univariate_ts.shape[0] // 2)
+        train, _ = train_test_split(
+            daily_univariate_ts, daily_univariate_ts.shape[0] // 2
+        )
         train["floor"] = 10.0
         train["cap"] = 80.0
         m = Prophet(growth="logistic", stan_backend=backend, scaling="minmax")
@@ -228,36 +249,43 @@ class TestProphetDataPrep:
         assert m2.history["y_scaled"].min() > 0.0
         assert m2.history["y_scaled"].max() < 1.0
         # Check that the scaling is the same
-        assert m2.history['y_scaled'].mean() == m.history['y_scaled'].mean()
+        assert m2.history["y_scaled"].mean() == m.history["y_scaled"].mean()
 
     def test_make_future_dataframe(self, daily_univariate_ts, backend):
         train = daily_univariate_ts.head(468 // 2)
         forecaster = Prophet(stan_backend=backend)
         forecaster.fit(train)
-        future = forecaster.make_future_dataframe(periods=3, freq="D", include_history=False)
+        future = forecaster.make_future_dataframe(
+            periods=3, freq="D", include_history=False
+        )
         correct = pd.DatetimeIndex(["2013-04-26", "2013-04-27", "2013-04-28"])
         assert len(future) == 3
         assert np.all(future["ds"].values == correct.values)
 
-        future = forecaster.make_future_dataframe(periods=3, freq=pd.tseries.offsets.MonthEnd(1), include_history=False)
+        future = forecaster.make_future_dataframe(
+            periods=3, freq=pd.tseries.offsets.MonthEnd(1), include_history=False
+        )
         correct = pd.DatetimeIndex(["2013-04-30", "2013-05-31", "2013-06-30"])
         assert len(future) == 3
         assert np.all(future["ds"].values == correct.values)
 
     def test_make_future_dataframe_include_history(self, daily_univariate_ts, backend):
         train = daily_univariate_ts.head(468 // 2).copy()
-        #cover history with NAs
+        # cover history with NAs
         train.loc[train.sample(10).index, "y"] = np.nan
-        
+
         forecaster = Prophet(stan_backend=backend)
         forecaster.fit(train)
-        future = forecaster.make_future_dataframe(periods=3, freq="D", include_history=True)
+        future = forecaster.make_future_dataframe(
+            periods=3, freq="D", include_history=True
+        )
 
         assert len(future) == train.shape[0] + 3
 
+
 class TestProphetTrendComponent:
     def test_invalid_growth_input(self, backend):
-        msg = 'Parameter "growth" should be "linear", ' '"logistic" or "flat".'
+        msg = 'Parameter "growth" should be "linear", "logistic" or "flat".'
         with pytest.raises(ValueError, match=msg):
             Prophet(growth="constant", stan_backend=backend)
 
@@ -299,7 +327,7 @@ class TestProphetTrendComponent:
         assert k == 0
         assert m == pytest.approx(0.32792770, abs=1e-4)
 
-    @pytest.mark.parametrize("scaling",["absmax","minmax"])
+    @pytest.mark.parametrize("scaling", ["absmax", "minmax"])
     def test_flat_growth(self, backend, scaling):
         m = Prophet(growth="flat", stan_backend=backend, scaling=scaling)
         x = np.linspace(0, 2 * np.pi, 8 * 7)
@@ -385,7 +413,9 @@ class TestProphetTrendComponent:
         """
         By default, Prophet uses the first 80% of the history to detect changepoints.
         """
-        train, _ = train_test_split(daily_univariate_ts, daily_univariate_ts.shape[0] // 2)
+        train, _ = train_test_split(
+            daily_univariate_ts, daily_univariate_ts.shape[0] // 2
+        )
         m = Prophet(stan_backend=backend)
         history = m.setup_dataframe(train, initialize_scales=True)
         m.history = history
@@ -398,7 +428,9 @@ class TestProphetTrendComponent:
         assert cp.max() <= history["t"].values[cp_indx]
 
     def test_set_changepoint_range(self, daily_univariate_ts, backend):
-        train, _ = train_test_split(daily_univariate_ts, daily_univariate_ts.shape[0] // 2)
+        train, _ = train_test_split(
+            daily_univariate_ts, daily_univariate_ts.shape[0] // 2
+        )
         m = Prophet(changepoint_range=0.4, stan_backend=backend)
         history = m.setup_dataframe(train, initialize_scales=True)
         m.history = history
@@ -414,7 +446,9 @@ class TestProphetTrendComponent:
                 m = Prophet(changepoint_range=out_of_range, stan_backend=backend)
 
     def test_get_zero_changepoints(self, daily_univariate_ts, backend):
-        train, _ = train_test_split(daily_univariate_ts, daily_univariate_ts.shape[0] // 2)
+        train, _ = train_test_split(
+            daily_univariate_ts, daily_univariate_ts.shape[0] // 2
+        )
         m = Prophet(n_changepoints=0, stan_backend=backend)
         history = m.setup_dataframe(train, initialize_scales=True)
         m.history = history
@@ -438,7 +472,9 @@ class TestProphetSeasonalComponent:
     def test_fourier_series_weekly(self, daily_univariate_ts):
         mat = Prophet.fourier_series(daily_univariate_ts["ds"], 7, 3)
         # These are from the R forecast package directly.
-        true_values = np.array([0.7818315, 0.6234898, 0.9749279, -0.2225209, 0.4338837, -0.9009689])
+        true_values = np.array(
+            [0.7818315, 0.6234898, 0.9749279, -0.2225209, 0.4338837, -0.9009689]
+        )
         assert np.sum((mat[0] - true_values) ** 2) == pytest.approx(0.0)
 
     def test_fourier_series_yearly(self, daily_univariate_ts):
@@ -476,7 +512,9 @@ class TestProphetSeasonalComponent:
         m = Prophet(stan_backend=backend)
         m.fit(train)
         assert "weekly" not in m.seasonalities
-        m = Prophet(weekly_seasonality=2, seasonality_prior_scale=3.0, stan_backend=backend)
+        m = Prophet(
+            weekly_seasonality=2, seasonality_prior_scale=3.0, stan_backend=backend
+        )
         m.fit(daily_univariate_ts)
         assert m.seasonalities["weekly"] == {
             "period": 7,
@@ -507,7 +545,9 @@ class TestProphetSeasonalComponent:
         m = Prophet(yearly_seasonality=True, stan_backend=backend)
         m.fit(train)
         assert "yearly" in m.seasonalities
-        m = Prophet(yearly_seasonality=7, seasonality_prior_scale=3.0, stan_backend=backend)
+        m = Prophet(
+            yearly_seasonality=7, seasonality_prior_scale=3.0, stan_backend=backend
+        )
         m.fit(daily_univariate_ts)
         assert m.seasonalities["yearly"] == {
             "period": 365.25,
@@ -517,7 +557,9 @@ class TestProphetSeasonalComponent:
             "condition_name": None,
         }
 
-    def test_auto_daily_seasonality(self, daily_univariate_ts, subdaily_univariate_ts, backend):
+    def test_auto_daily_seasonality(
+        self, daily_univariate_ts, subdaily_univariate_ts, backend
+    ):
         # Should be enabled
         m = Prophet(stan_backend=backend)
         assert m.daily_seasonality == "auto"
@@ -538,7 +580,9 @@ class TestProphetSeasonalComponent:
         m = Prophet(daily_seasonality=True, stan_backend=backend)
         m.fit(train)
         assert "daily" in m.seasonalities
-        m = Prophet(daily_seasonality=7, seasonality_prior_scale=3.0, stan_backend=backend)
+        m = Prophet(
+            daily_seasonality=7, seasonality_prior_scale=3.0, stan_backend=backend
+        )
         m.fit(subdaily_univariate_ts)
         assert m.seasonalities["daily"] == {
             "period": 1,
@@ -581,7 +625,9 @@ class TestProphetSeasonalComponent:
                 "upper_window": [0],
             }
         )
-        m = Prophet(seasonality_mode="multiplicative", holidays=holidays, stan_backend=backend)
+        m = Prophet(
+            seasonality_mode="multiplicative", holidays=holidays, stan_backend=backend
+        )
         m.add_seasonality("monthly", period=30, mode="additive", fourier_order=3)
         m.add_regressor("binary_feature", mode="additive")
         m.add_regressor("numeric_feature")
@@ -592,7 +638,9 @@ class TestProphetSeasonalComponent:
         df = m.setup_dataframe(df, initialize_scales=True)
         m.history = df.copy()
         m.set_auto_seasonalities()
-        seasonal_features, prior_scales, component_cols, modes = m.make_all_seasonality_features(df)
+        seasonal_features, prior_scales, component_cols, modes = (
+            m.make_all_seasonality_features(df)
+        )
         assert sum(component_cols["additive_terms"]) == 7
         assert sum(component_cols["multiplicative_terms"]) == 29
         assert set(modes["additive"]) == {
@@ -668,8 +716,8 @@ class TestProphetCustomSeasonalComponent:
         m.fit(daily_univariate_ts)
         assert m.seasonalities["monthly"]["mode"] == "additive"
         assert m.seasonalities["weekly"]["mode"] == "multiplicative"
-        seasonal_features, prior_scales, component_cols, modes = m.make_all_seasonality_features(
-            m.history
+        seasonal_features, prior_scales, component_cols, modes = (
+            m.make_all_seasonality_features(m.history)
         )
         assert sum(component_cols["monthly"]) == 10
         assert sum(component_cols["special_day"]) == 1
@@ -688,7 +736,9 @@ class TestProphetCustomSeasonalComponent:
         assert prior_scales == true
 
     def test_conditional_custom_seasonality(self, daily_univariate_ts, backend):
-        m = Prophet(weekly_seasonality=False, yearly_seasonality=False, stan_backend=backend)
+        m = Prophet(
+            weekly_seasonality=False, yearly_seasonality=False, stan_backend=backend
+        )
         m.add_seasonality(
             name="conditional_weekly",
             period=7,
@@ -696,7 +746,9 @@ class TestProphetCustomSeasonalComponent:
             prior_scale=2.0,
             condition_name="is_conditional_week",
         )
-        m.add_seasonality(name="normal_monthly", period=30.5, fourier_order=5, prior_scale=2.0)
+        m.add_seasonality(
+            name="normal_monthly", period=30.5, fourier_order=5, prior_scale=2.0
+        )
         df = daily_univariate_ts.copy()
         with pytest.raises(ValueError):
             # Require all conditions names in df
@@ -715,8 +767,8 @@ class TestProphetCustomSeasonalComponent:
             "condition_name": "is_conditional_week",
         }
         assert m.seasonalities["normal_monthly"]["condition_name"] is None
-        seasonal_features, prior_scales, component_cols, modes = m.make_all_seasonality_features(
-            m.history
+        seasonal_features, prior_scales, component_cols, modes = (
+            m.make_all_seasonality_features(m.history)
         )
         # Confirm that only values without is_conditional_week has non zero entries
         condition_cols = [
@@ -877,7 +929,6 @@ class TestProphetHolidays:
         assert sum(fcst["special_day"] == 0) == 575
 
 
-
 class TestProphetRegressors:
     def test_added_regressors(self, daily_univariate_ts, backend):
         m = Prophet(stan_backend=backend)
@@ -904,19 +955,25 @@ class TestProphetRegressors:
         }
         assert m.extra_regressors["numeric_feature"]["prior_scale"] == 0.5
         assert m.extra_regressors["numeric_feature"]["mu"] == 254.5
-        assert m.extra_regressors["numeric_feature"]["std"] == pytest.approx(147.368585, abs=1e-5)
+        assert m.extra_regressors["numeric_feature"]["std"] == pytest.approx(
+            147.368585, abs=1e-5
+        )
         assert m.extra_regressors["numeric_feature2"]["mode"] == "multiplicative"
         assert m.extra_regressors["binary_feature2"]["prior_scale"] == 10.0
-        assert m.extra_regressors["binary_feature2"]["mu"] == pytest.approx(0.1960784, abs=1e-5)
-        assert m.extra_regressors["binary_feature2"]["std"] == pytest.approx(0.3974183, abs=1e-5)
+        assert m.extra_regressors["binary_feature2"]["mu"] == pytest.approx(
+            0.1960784, abs=1e-5
+        )
+        assert m.extra_regressors["binary_feature2"]["std"] == pytest.approx(
+            0.3974183, abs=1e-5
+        )
         # Check that standardization is done correctly
         df2 = m.setup_dataframe(df.copy())
         assert df2["binary_feature"][0] == 0
         assert df2["numeric_feature"][0] == pytest.approx(-1.726962, abs=1e-4)
         assert df2["binary_feature2"][0] == pytest.approx(2.022859, abs=1e-4)
         # Check that feature matrix and prior scales are correctly constructed
-        seasonal_features, prior_scales, component_cols, modes = m.make_all_seasonality_features(
-            df2
+        seasonal_features, prior_scales, component_cols, modes = (
+            m.make_all_seasonality_features(df2)
         )
         assert seasonal_features.shape[1] == 30
         names = ["binary_feature", "numeric_feature", "binary_feature2"]
@@ -954,7 +1011,8 @@ class TestProphetRegressors:
             fcst["extra_regressors_multiplicative"][0]
         )
         assert fcst["yhat"][0] == pytest.approx(
-            fcst["trend"][0] * (1 + fcst["multiplicative_terms"][0]) + fcst["additive_terms"][0]
+            fcst["trend"][0] * (1 + fcst["multiplicative_terms"][0])
+            + fcst["additive_terms"][0]
         )
 
     def test_constant_regressor(self, daily_univariate_ts, backend):
@@ -979,6 +1037,8 @@ class TestProphetWarmStart:
             daily_univariate_ts.iloc[:500], show_progress=False
         )
         m2 = Prophet(mcmc_samples=100, stan_backend=backend).fit(
-            daily_univariate_ts.iloc[:510], init=warm_start_params(m), show_progress=False
+            daily_univariate_ts.iloc[:510],
+            init=warm_start_params(m),
+            show_progress=False,
         )
         assert m2.params["delta"].shape == (200, 25)

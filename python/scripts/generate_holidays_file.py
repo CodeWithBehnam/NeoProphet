@@ -22,7 +22,9 @@ def utf8_to_ascii(text: str) -> str:
     """Holidays often have utf-8 characters. These are not allowed in R package data (they generate a NOTE).
     TODO: revisit whether we want to do this lossy conversion.
     """
-    ascii_text = unicodedata.normalize("NFD", text).encode("ascii", "ignore").decode("ascii")
+    ascii_text = (
+        unicodedata.normalize("NFD", text).encode("ascii", "ignore").decode("ascii")
+    )
     # Remove trailing empty brackets and spaces.
     ascii_text = re.sub(r"\(\)$", "", ascii_text).strip()
 

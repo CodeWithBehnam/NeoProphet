@@ -29,6 +29,7 @@ TBB_DIRS = ["tbb", "tbb_2020.3"]
 
 IS_WINDOWS = platform.platform().startswith("Win")
 
+
 def prune_cmdstan(cmdstan_dir: str) -> None:
     """
     Keep only the cmdstan executables and tbb files (minimum required to run a cmdstanpy commands on a pre-compiled model).
@@ -76,6 +77,7 @@ def maybe_install_cmdstan_toolchain() -> bool:
         cmdstanpy.utils.cxx_toolchain_path()
         return True
 
+
 def install_cmdstan_deps(cmdstan_dir: Path):
     import cmdstanpy
     from multiprocessing import cpu_count
@@ -121,7 +123,9 @@ def build_cmdstan_model(target_dir):
         install_cmdstan_deps(cmdstan_dir)
         model_name = "prophet.stan"
         # note: ensure copy target is a directory not a file.
-        temp_stan_file = copy(os.path.join(MODEL_DIR, model_name), cmdstan_dir.parent.resolve())
+        temp_stan_file = copy(
+            os.path.join(MODEL_DIR, model_name), cmdstan_dir.parent.resolve()
+        )
         sm = cmdstanpy.CmdStanModel(stan_file=temp_stan_file)
         target_name = "prophet_model.bin"
         copy(sm.exe_file, os.path.join(target_dir, target_name))

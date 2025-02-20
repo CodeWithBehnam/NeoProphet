@@ -7,9 +7,9 @@ import logging
 
 from prophet.forecaster import Prophet
 
-logger = logging.getLogger('fbprophet')
+logger = logging.getLogger("fbprophet")
 
 logger.warning(
     'As of v1.0, the package name has changed from "fbprophet" to "prophet". '
-    'Please update references in your code accordingly.'
+    "Please update references in your code accordingly."
 )

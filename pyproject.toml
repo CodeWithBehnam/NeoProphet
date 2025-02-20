@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "numpy>=2.2.3",
+    "ruff>=0.9.7",
+    "tqdm>=4.67.1",
+]
 [tool.uv]
 cache-dir = "./.uv_cache"
 
