@@ -117,11 +117,11 @@ parameters {
 transformed parameters {
   vector[T] trend;
   if (trend_indicator == 0) {
-    trend = linear_trend(k, m, delta, t, A, t_change);
+    trend = linear_trend(k, m, delta, t, A, t_change);  // Linear growth with changepoints
   } else if (trend_indicator == 1) {
-    trend = logistic_trend(k, m, delta, t, cap, A, t_change, S);
+    trend = logistic_trend(k, m, delta, t, cap, A, t_change, S);  // Logistic growth with capacity
   } else if (trend_indicator == 2) {
-    trend = flat_trend(m, T);
+    trend = flat_trend(m, T);  // Constant trend (ignores k and delta)
   }
 }
 
