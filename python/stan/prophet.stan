@@ -130,7 +130,7 @@ model {
   k ~ normal(0, 5);
   m ~ normal(0, 5);
   delta ~ double_exponential(0, tau);
-  sigma_obs ~ normal(0, 0.5) T[0,];
+  sigma_obs ~ normal(0, 0.5); // Truncated at 0 due to <lower=0>, acts as half-normal
   beta ~ normal(0, sigmas);
 
   // Likelihood
