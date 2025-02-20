@@ -126,14 +126,13 @@ transformed parameters {
 }
 
 model {
-  //priors
-  k ~ normal(0, 5);
-  m ~ normal(0, 5);
-  delta ~ double_exponential(0, tau);
-  sigma_obs ~ normal(0, 0.5); // Truncated at 0 due to <lower=0>, acts as half-normal
-  beta ~ normal(0, sigmas);
-
-  // Likelihood
+  // Priors for trend parameters
+  k ~ normal(0, 5);        // Growth rate prior (wide, assumes unscaled data)
+  m ~ normal(0, 5);        // Offset prior
+  delta ~ double_exponential(0, tau);  // Laplace prior for sparse changepoints
+  sigma_obs ~ normal(0, 0.5);  // Noise scale (half-normal due to <lower=0>)
+  beta ~ normal(0, sigmas);    // Regressor coefficients with feature-specific scales
+  // Likelihood: combines additive regressors and multiplicative trend adjustments
   y ~ normal_id_glm(
     X_sa,
     trend .* (1 + X_sm * beta),
