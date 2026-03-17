@@ -1,309 +1,153 @@
 
-# Prophet: Automatic Forecasting Procedure
+# NeoProphet: Prophet with a Go Wrapper Service
 
-![Build](https://github.com/facebook/prophet/workflows/Build/badge.svg)
+A fork of [Facebook Prophet](https://github.com/facebook/prophet) — the additive time series forecasting library — extended with a **high-performance Go wrapper service** for production serving.
 
-[![PyPI Version](https://img.shields.io/pypi/v/prophet.svg)](https://pypi.python.org/pypi/prophet)
-[![PyPI Downloads Monthly](https://pepy.tech/badge/prophet/month)](https://pepy.tech/project/prophet)
-[![PyPI Downloads All](https://pepy.tech/badge/prophet)](https://pepy.tech/project/prophet)
+The Go service wraps the same compiled Stan binary that Python uses, reimplements data preparation and prediction math in pure Go, and exposes a REST API. Benchmarks on real datasets show **~200x faster prediction** and **~10x faster cross-validation** with identical forecast accuracy.
 
-[![CRAN Version](https://www.r-pkg.org/badges/version/prophet)](https://CRAN.R-project.org/package=prophet)
-[![CRAN Downloads Monthly](https://cranlogs.r-pkg.org/badges/prophet?color=brightgreen)](https://cran.r-project.org/package=prophet)
-[![CRAN Downloads All](https://cranlogs.r-pkg.org/badges/grand-total/prophet?color=brightgreen)](https://cranlogs.r-pkg.org/badges/grand-total/prophet)
+## Benchmark: Python vs Go
 
-[![Conda_Version](https://anaconda.org/conda-forge/prophet/badges/version.svg)](https://anaconda.org/conda-forge/prophet/)
+Tested on the Peyton Manning Wikipedia pageviews dataset (2,905 daily observations):
 
------
+| Metric | Python | Go | Speedup |
+|--------|-------:|---:|--------:|
+| Fit (mean) | 0.363s | 0.252s | **1.4x** |
+| Predict (mean, 3270 rows) | 0.181s | 0.001s | **199x** |
+| Cross-validation (24 cutoffs) | 4.958s | 0.482s | **10.3x** |
+| CV MAPE | 0.0548 | 0.0547 | **0.2% relative diff** |
 
-**2023 Update:** We discuss our plans for the future of Prophet in this blog post: [facebook/prophet in 2023 and beyond](https://medium.com/@cuongduong_35162/facebook-prophet-in-2023-and-beyond-c5086151c138)
+Both implementations call the same compiled CmdStan binary for model fitting — the speedup comes from Go's native math for prediction and goroutine parallelism for cross-validation.
 
------
+## Architecture
 
-Prophet is a procedure for forecasting time series data based on an additive model where non-linear trends are fit with yearly, weekly, and daily seasonality, plus holiday effects. It works best with time series that have strong seasonal effects and several seasons of historical data. Prophet is robust to missing data and shifts in the trend, and typically handles outliers well.
-
-Prophet is [open source software](https://code.facebook.com/projects/) released by Facebook's [Core Data Science team](https://research.fb.com/category/data-science/). It is available for download on [CRAN](https://cran.r-project.org/package=prophet) and [PyPI](https://pypi.python.org/pypi/prophet/).
-
-## Important links
-
-- Homepage: https://facebook.github.io/prophet/
-- HTML documentation: https://facebook.github.io/prophet/docs/quick_start.html
-- Issue tracker: https://github.com/facebook/prophet/issues
-- Source code repository: https://github.com/facebook/prophet
-- Contributing: https://facebook.github.io/prophet/docs/contributing.html
-- Prophet R package: https://cran.r-project.org/package=prophet
-- Prophet Python package: https://pypi.python.org/pypi/prophet/
-- Release blogpost: https://research.facebook.com/blog/2017/2/prophet-forecasting-at-scale/
-- Prophet paper: Sean J. Taylor, Benjamin Letham (2018) Forecasting at scale. The American Statistician 72(1):37-45 (https://peerj.com/preprints/3190.pdf).
-
-## Installation in R - CRAN
-
-⚠️ **The CRAN version of prophet is fairly outdated. To get the latest bug fixes and updated country holiday data, we suggest installing the [latest release](#installation-in-r---latest-release).**
-
-Prophet is a [CRAN package](https://cran.r-project.org/package=prophet) so you can use `install.packages`.
-
-```r
-install.packages('prophet')
+```
+python/
+  prophet/              # Original Python Prophet library
+    forecaster.py       # Core Prophet class — fit(), predict()
+    models.py           # CmdStanPy backend (shells out to Stan binary)
+    diagnostics.py      # cross_validation(), performance_metrics()
+  stan/
+    prophet.stan        # The Stan model (logistic + linear trend)
+go/
+  cmd/
+    server/             # HTTP service entrypoint
+    bench/              # Single-dataset benchmark CLI
+    bench_all/          # Multi-dataset benchmark CLI (JSON-driven)
+  internal/
+    cmdstan/            # exec.CommandContext wrapper + CSV parser
+    prophet/            # Go Prophet: Fourier, changepoints, scaling, trend
+    diagnostics/        # Parallel cross-validation via errgroup
+    pool/               # Bounded-concurrency worker pool
+  api/http/             # REST: /v1/fit, /v1/predict, /v1/cv, /v1/health
+R/                      # R package (CRAN-published)
+notebooks/
+  benchmark_python_vs_go.ipynb    # Single-dataset benchmark with visualizations
+  benchmark_all_datasets.ipynb    # All 8 datasets with hyperparameter tuning
+benchmarks/             # CLI benchmark scripts
+examples/               # Example datasets (CSV)
 ```
 
-After installation, you can [get started!](https://facebook.github.io/prophet/docs/quick_start.html#r-api)
+## Quick Start
 
-## Installation in R - Latest release
-
-```r
-install.packages('remotes')
-remotes::install_github('facebook/prophet@*release', subdir = 'R')
-```
-
-#### Experimental backend - cmdstanr
-
-You can also choose an experimental alternative stan backend called `cmdstanr`. Once you've installed `prophet`,
-follow these instructions to use `cmdstanr` instead of `rstan` as the backend:
-
-```r
-# R
-# We recommend running this in a fresh R session or restarting your current session
-install.packages(c("cmdstanr", "posterior"), repos = c("https://stan-dev.r-universe.dev", getOption("repos")))
-
-# If you haven't installed cmdstan before, run:
-cmdstanr::install_cmdstan()
-# Otherwise, you can point cmdstanr to your cmdstan path:
-cmdstanr::set_cmdstan_path(path = <your existing cmdstan>)
-
-# Set the R_STAN_BACKEND environment variable
-Sys.setenv(R_STAN_BACKEND = "CMDSTANR")
-```
-
-### Windows
-
-On Windows, R requires a compiler so you'll need to [follow the instructions](https://github.com/stan-dev/rstan/wiki/RStan-Getting-Started) provided by `rstan`. The key step is installing [Rtools](http://cran.r-project.org/bin/windows/Rtools/) before attempting to install the package.
-
-If you have custom Stan compiler settings, install from source rather than the CRAN binary.
-
-## Installation in Python - PyPI release
-
-Prophet is on PyPI, so you can use `pip` to install it.
+### Python
 
 ```bash
-python -m pip install prophet
+cd python
+uv pip install -e ".[dev]"
+uv run pytest prophet/tests
 ```
 
-* From v0.6 onwards, Python 2 is no longer supported.
-* As of v1.0, the package name on PyPI is "prophet"; prior to v1.0 it was "fbprophet".
-* As of v1.1, the minimum supported Python version is 3.7.
+```python
+from prophet import Prophet
+import pandas as pd
 
-After installation, you can [get started!](https://facebook.github.io/prophet/docs/quick_start.html#python-api)
+df = pd.read_csv("examples/example_wp_log_peyton_manning.csv")
+m = Prophet()
+m.fit(df)
+future = m.make_future_dataframe(periods=365)
+forecast = m.predict(future)
+```
 
-### Anaconda
-
-Prophet can also be installed through conda-forge.
+### Go Service
 
 ```bash
-conda install -c conda-forge prophet
+# Compile the Stan model (one-time)
+cd python && uv run python -c "from prophet.models import CmdStanPyBackend; CmdStanPyBackend().load_model()"
+
+# Start the Go server
+cd go
+export PROPHET_STAN_BINARY=../python/prophet/stan_model/prophet_model.bin
+go run ./cmd/server --http :8080
 ```
-
-## Installation in Python - Development version
-
-To get the latest code changes as they are merged, you can clone this repo and build from source manually. This is **not** guaranteed to be stable.
 
 ```bash
-git clone https://github.com/facebook/prophet.git
-cd prophet/python
-python -m pip install -e .
+# Fit a model
+curl -X POST http://localhost:8080/v1/fit \
+  -H "Content-Type: application/json" \
+  -d '{"ds": [1577836800, ...], "y": [9.59, ...], "config": {}}'
+
+# Predict
+curl -X POST http://localhost:8080/v1/predict \
+  -H "Content-Type: application/json" \
+  -d '{"model_id": "model-xxx", "periods": 365}'
 ```
 
-By default, Prophet will use a fixed version of `cmdstan` (downloading and installing it if necessary) to compile the model executables. If this is undesired and you would like to use your own existing `cmdstan` installation, you can set the environment variable `PROPHET_REPACKAGE_CMDSTAN` to `False`:
+### Run Benchmarks
 
 ```bash
-export PROPHET_REPACKAGE_CMDSTAN=False; python -m pip install -e .
+# Interactive notebook (recommended)
+cd python && uv run jupyter lab ../notebooks/benchmark_all_datasets.ipynb
+
+# CLI benchmark
+bash benchmarks/run_benchmark.sh
 ```
 
-### Linux
+## Notebooks
 
-Make sure compilers (gcc, g++, build-essential) and Python development tools (python-dev, python3-dev) are installed. In Red Hat systems, install the packages gcc64 and gcc64-c++. If you are using a VM, be aware that you will need at least 4GB of memory to install prophet, and at least 2GB of memory to use prophet.
+| Notebook | Description |
+|----------|-------------|
+| `benchmark_python_vs_go.ipynb` | Single-dataset (Peyton Manning) benchmark with forecast visualization, component plots, MAPE comparison |
+| `benchmark_all_datasets.ipynb` | All 8 example datasets with per-dataset hyperparameter tuning, forecasts gallery, aggregate speed comparison |
 
-### Windows
+## Go API Endpoints
 
-Using `cmdstanpy` with Windows requires a Unix-compatible C compiler such as mingw-gcc. If cmdstanpy is installed first, one can be installed via the `cmdstanpy.install_cxx_toolchain` command.
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/fit` | POST | Fit a Prophet model, returns model ID + parameters |
+| `/v1/predict` | POST | Generate forecasts from a fitted model |
+| `/v1/cv` | POST | Run cross-validation with parallel SHFs |
+| `/v1/health` | GET | Service + Stan binary health check |
 
-## Changelog
+## How It Works
 
-See [Release Notes](https://github.com/facebook/prophet/releases).
+Prophet decomposes time series into three components:
 
-### Version 1.3.0 (2026.01.27)
+```
+y(t) = g(t) + s(t) + h(t) + εₜ
+```
 
-#### Python
+- **g(t)** — Trend: piecewise linear or logistic growth with automatic changepoints
+- **s(t)** — Seasonality: Fourier series for yearly, weekly, and daily patterns
+- **h(t)** — Holidays: indicator functions for irregular events
+- **εₜ** — Error: normally distributed noise
 
-- Support pandas>=3.0 and numpy>=2.4.
+Both Python and Go share the same Stan model for MAP estimation (L-BFGS optimizer). The Go service reimplements data preparation (Fourier features, changepoint matrices, y-scaling) and prediction math (trend + seasonal components) in native Go for speed.
 
-### Version 1.2.2 (2026.01.25)
+## Key Hyperparameters
 
-#### Python
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `changepoint_prior_scale` (τ) | 0.05 | Trend flexibility — higher = more changepoints active |
+| `seasonality_prior_scale` (σ) | 10.0 | Seasonality strength — lower = smoother seasonal patterns |
+| `seasonality_mode` | additive | `multiplicative` for series where seasonal amplitude scales with trend |
+| `n_changepoints` | 25 | Number of potential changepoint locations |
+| `growth` | linear | `logistic` for saturating growth, `flat` for no trend |
 
-- Version constraints on pandas (`<3`) and numpy (`<2.4`).
+## References
 
-#### R
-- Update build requirements to C++17 to Comply with CRAN Policy.
-- Add .tar.gz upload for R package to CI.
-- Re-generated holidays.csv for R package.
-
-### Version 1.2.1 (2025.10.22)
-
-#### Python
-
-- Also copy makefile to fake cmdstan.
-
-### Version 1.2.0 (2025.05.30)
-
-#### Python
-
-- Use latest CmdStan.
-- Add null check to CmdStanPyBackend cleanup() function.
-
-### Version 1.1.7 (2025.05.30)
-
-#### Python
-
-- Enable creation of custom performance metrics.
-- chore: address pandas futurewarning from "M" being deprecated.
-- cleanup() for cross_validate.
-
-### Version 1.1.6 (2024.09.29)
-
-#### Python
-
-- Bug fixes: include predictions for dates with missing `y` the history, zero division error in cross validation metrics.
-- Changed `NDArray[np.float_]` to `NDArray[np.float64]` to be compatible with numpy 2.0
-
-#### R
-
-- Updated `holidays` data based on holidays version 0.57.
-
-### Version 1.1.5 (2023.10.10)
-
-#### Python
-
-- Upgraded cmdstan version to 2.33.1, enabling Apple M2 support.
-- Added pre-built wheels for macOS arm64 architecture (M1, M2 chips)
-- Added argument `scaling` to the `Prophet()` instantiation. Allows `minmax` scaling on `y` instead of
-  `absmax` scaling (dividing by the maximum value). `scaling='absmax'` by default, preserving the
-  behaviour of previous versions.
-- Added argument `holidays_mode` to the `Prophet()` instantiation. Allows holidays regressors to have
-  a different mode than seasonality regressors. `holidays_mode` takes the same value as `seasonality_mode`
-  if not specified, preserving the behaviour of previous versions.
-- Added two methods to the `Prophet` object: `preprocess()` and `calculate_initial_params()`. These
-  do not need to be called and will not change the model fitting process. Their purpose is to provide
-  clarity on the pre-processing steps taken (`y` scaling, creating fourier series, regressor scaling,
-  setting changepoints, etc.) before the data is passed to the stan model.
-- Added argument `extra_output_columns` to `cross_validation()`. The user can specify additional columns
-  from `predict()` to include in the final output alongside `ds` and `yhat`, for example `extra_output_columns=['trend']`.
-- prophet's custom `hdays` module was deprecated last version and is now removed.
-
-#### R
-
-- Updated `holidays` data based on holidays version 0.34.
-
-### Version 1.1.4 (2023.05.30)
-
-#### Python
-
-- We now rely solely on `holidays` package for country holidays.
-- Upgraded cmdstan version to 2.31.0, enabling Apple M1 support.
-- Fixed bug with Windows installation caused by long paths.
-
-#### R
-
-- Updated `holidays` data based on holidays version 0.25.
-
-### Version 1.1.2 (2023.01.20)
-
-#### Python
-
-- Sped up `.predict()` by up to 10x by removing intermediate DataFrame creations.
-- Sped up fourier series generation, leading to at least 1.5x speed improvement for `train()` and `predict()` pipelines.
-- Fixed bug in how warm start values were being read.
-- Wheels are now version-agnostic.
-
-#### R
-
-- Fixed a bug in `construct_holiday_dataframe()`
-- Updated `holidays` data based on holidays version 0.18.
-
-### Version 1.1.1 (2022.09.08)
-
-- (Python) Improved runtime (3-7x) of uncertainty predictions via vectorization.
-- Bugfixes relating to Python package versions and R holiday objects.
-
-### Version 1.1 (2022.06.25)
-
-- Replaced `pystan2` dependency with `cmdstan` + `cmdstanpy`.
-- Pre-packaged model binaries for Python package, uploaded binary distributions to PyPI.
-- Improvements in the `stan` model code, cross-validation metric calculations, holidays.
-
-### Version 1.0 (2021.03.28)
-
-- Python package name changed from fbprophet to prophet
-- Fixed R Windows build issues to get latest version back on CRAN
-- Improvements in serialization, holidays, and R timezone handling
-- Plotting improvements
-
-### Version 0.7 (2020.09.05)
-
-- Built-in json serialization
-- Added "flat" growth option
-- Bugfixes related to `holidays` and `pandas`
-- Plotting improvements
-- Improvements in cross validation, such as parallelization and directly specifying cutoffs
-
-### Version 0.6 (2020.03.03)
-
-- Fix bugs related to upstream changes in `holidays` and `pandas` packages.
-- Compile model during first use, not during install (to comply with CRAN policy)
-- `cmdstanpy` backend now available in Python
-- Python 2 no longer supported
-
-### Version 0.5 (2019.05.14)
-
-- Conditional seasonalities
-- Improved cross validation estimates
-- Plotly plot in Python
-- Bugfixes
-
-### Version 0.4 (2018.12.18)
-
-- Added holidays functionality
-- Bugfixes
-
-### Version 0.3 (2018.06.01)
-
-- Multiplicative seasonality
-- Cross validation error metrics and visualizations
-- Parameter to set range of potential changepoints
-- Unified Stan model for both trend types
-- Improved future trend uncertainty for sub-daily data
-- Bugfixes
-
-### Version 0.2.1 (2017.11.08)
-
-- Bugfixes
-
-### Version 0.2 (2017.09.02)
-
-- Forecasting with sub-daily data
-- Daily seasonality, and custom seasonalities
-- Extra regressors
-- Access to posterior predictive samples
-- Cross-validation function
-- Saturating minimums
-- Bugfixes
-
-### Version 0.1.1 (2017.04.17)
-
-- Bugfixes
-- New options for detecting yearly and weekly seasonality (now the default)
-
-### Version 0.1 (2017.02.23)
-
-- Initial release
+- **Paper**: Taylor & Letham (2018). *Forecasting at Scale*. The American Statistician 72(1):37-45. [PeerJ Preprint](https://peerj.com/preprints/3190/).
+- **Original repo**: [github.com/facebook/prophet](https://github.com/facebook/prophet)
+- **Documentation**: [facebook.github.io/prophet](https://facebook.github.io/prophet/)
 
 ## License
 
