@@ -49,6 +49,7 @@ dev = [
   "plotly",
   "pyrefly==0.50.0",
   "ipykernel",
+  "ipywidgets",
 ]
 parallel = [
   "dask[dataframe]",
