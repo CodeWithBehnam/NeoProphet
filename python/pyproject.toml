@@ -48,6 +48,7 @@ dev = [
   "nbconvert",
   "plotly",
   "pyrefly==0.50.0",
+  "ipykernel",
 ]
 parallel = [
   "dask[dataframe]",
