@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
-	"math/rand"
 	"os"
 	"time"
 
@@ -25,6 +23,11 @@ type benchResults struct {
 	CVMAPE       float64 `json:"cv_mape"`
 }
 
+type dataRecord struct {
+	DS float64 `json:"ds"`
+	Y  float64 `json:"y"`
+}
+
 func main() {
 	stanPath := os.Getenv("PROPHET_STAN_BINARY")
 	if stanPath == "" {
@@ -32,17 +35,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	nDays := 1095
-	if len(os.Args) > 1 {
-		fmt.Sscan(os.Args[1], &nDays)
+	// Load dataset exported by Python benchmark for exact parity
+	dataPath := "/tmp/prophet_bench_data.json"
+	data, err := loadDataset(dataPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load %s: %v\nRun the Python benchmark first.\n", dataPath, err)
+		os.Exit(1)
 	}
 
-	fmt.Printf("=== Go Prophet Benchmark (%d days) ===\n\n", nDays)
+	nDays := len(data)
+	fmt.Printf("=== Go Prophet Benchmark (%d days) ===\n", nDays)
+	fmt.Printf("Loaded dataset from %s\n\n", dataPath)
 
-	data := generateDataset(nDays)
 	runner := cmdstan.NewRunner(stanPath)
 	config := prophet.DefaultConfig()
-
 	ctx := context.Background()
 
 	// --- Fit ---
@@ -88,10 +94,10 @@ func main() {
 	fmt.Println("\n--- Cross-Validation ---")
 	cvStart := time.Now()
 	cvResults, err := diagnostics.CrossValidate(ctx, f, data, diagnostics.CVConfig{
-		InitialDays: 365,
+		InitialDays: 730,
 		PeriodDays:  90,
 		HorizonDays: 90,
-		MaxWorkers:  0, // use all CPUs
+		MaxWorkers:  0,
 	})
 	cvTime := time.Since(cvStart).Seconds()
 	if err != nil {
@@ -129,29 +135,22 @@ func main() {
 	fmt.Println("\nResults saved to /tmp/prophet_bench_go.json")
 }
 
-// generateDataset creates the same synthetic data as the Python benchmark.
-func generateDataset(nDays int) []prophet.DataPoint {
-	rng := rand.New(rand.NewSource(42))
-	baseDS := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-
-	data := make([]prophet.DataPoint, nDays)
-	for i := 0; i < nDays; i++ {
-		t := float64(i)
-		ds := baseDS.Add(time.Duration(i) * 24 * time.Hour)
-
-		trend := 100 + 0.05*t
-		yearly := 10*math.Sin(2*math.Pi*t/365.25) +
-			5*math.Cos(2*math.Pi*t/365.25) +
-			3*math.Sin(4*math.Pi*t/365.25)
-		weekly := 5 * math.Sin(2*math.Pi*t/7)
-		noise := rng.NormFloat64() * 3
-
-		data[i] = prophet.DataPoint{
-			DS: float64(ds.Unix()),
-			Y:  trend + yearly + weekly + noise,
-		}
+func loadDataset(path string) ([]prophet.DataPoint, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
-	return data
+
+	var records []dataRecord
+	if err := json.Unmarshal(raw, &records); err != nil {
+		return nil, err
+	}
+
+	data := make([]prophet.DataPoint, len(records))
+	for i, r := range records {
+		data[i] = prophet.DataPoint{DS: r.DS, Y: r.Y}
+	}
+	return data, nil
 }
 
 func mean(vals []float64) float64 {

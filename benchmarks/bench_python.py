@@ -1,7 +1,9 @@
-"""Benchmark Python Prophet: fit, predict, and cross-validation."""
+"""Benchmark Python Prophet: fit, predict, and cross-validation.
+Uses the Peyton Manning Wikipedia pageviews dataset from examples/."""
 
 import time
 import json
+import os
 import sys
 import numpy as np
 import pandas as pd
@@ -9,42 +11,32 @@ import pandas as pd
 from prophet import Prophet
 from prophet.diagnostics import cross_validation, performance_metrics
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
+DATASET_PATH = os.path.join(PROJECT_DIR, "examples", "example_wp_log_peyton_manning.csv")
 
-def generate_dataset(n_days: int = 1095) -> pd.DataFrame:
-    """Generate a synthetic daily time series with trend + seasonality + noise."""
-    np.random.seed(42)
-    ds = pd.date_range("2020-01-01", periods=n_days, freq="D")
-    t = np.arange(n_days, dtype=float)
 
-    # Linear trend
-    trend = 100 + 0.05 * t
+def load_dataset() -> pd.DataFrame:
+    df = pd.read_csv(DATASET_PATH)
+    df["ds"] = pd.to_datetime(df["ds"])
+    return df
 
-    # Yearly seasonality (Fourier, 2 terms)
-    yearly = (
-        10 * np.sin(2 * np.pi * t / 365.25)
-        + 5 * np.cos(2 * np.pi * t / 365.25)
-        + 3 * np.sin(4 * np.pi * t / 365.25)
-    )
 
-    # Weekly seasonality
-    weekly = 5 * np.sin(2 * np.pi * t / 7)
-
-    noise = np.random.normal(0, 3, n_days)
-    y = trend + yearly + weekly + noise
-
-    return pd.DataFrame({"ds": ds, "y": y})
+def export_dataset(df: pd.DataFrame, path: str):
+    """Export dataset as JSON for Go benchmark to consume."""
+    records = []
+    for _, row in df.iterrows():
+        records.append({"ds": row["ds"].timestamp(), "y": float(row["y"])})
+    with open(path, "w") as f:
+        json.dump(records, f)
+    print(f"  exported {len(records)} rows to {path}")
 
 
 def benchmark_fit(df: pd.DataFrame, n_runs: int = 3) -> dict:
-    """Benchmark fit() timing."""
     times = []
     model = None
     for i in range(n_runs):
-        m = Prophet(
-            yearly_seasonality=True,
-            weekly_seasonality=True,
-            daily_seasonality=False,
-        )
+        m = Prophet()
         start = time.perf_counter()
         m.fit(df)
         elapsed = time.perf_counter() - start
@@ -56,7 +48,6 @@ def benchmark_fit(df: pd.DataFrame, n_runs: int = 3) -> dict:
 
 
 def benchmark_predict(model: Prophet, periods: int = 365, n_runs: int = 5) -> dict:
-    """Benchmark predict() timing."""
     future = model.make_future_dataframe(periods=periods)
     times = []
     for i in range(n_runs):
@@ -69,17 +60,12 @@ def benchmark_predict(model: Prophet, periods: int = 365, n_runs: int = 5) -> di
 
 
 def benchmark_cv(df: pd.DataFrame) -> dict:
-    """Benchmark cross_validation() timing."""
-    m = Prophet(
-        yearly_seasonality=True,
-        weekly_seasonality=True,
-        daily_seasonality=False,
-    )
+    m = Prophet()
     m.fit(df)
 
     start = time.perf_counter()
     cv_results = cross_validation(
-        m, initial="365 days", period="90 days", horizon="90 days"
+        m, initial="730 days", period="90 days", horizon="90 days"
     )
     cv_time = time.perf_counter() - start
 
@@ -91,24 +77,11 @@ def benchmark_cv(df: pd.DataFrame) -> dict:
     return {"cv_time": cv_time, "n_cutoffs": n_cutoffs, "mape": mape}
 
 
-def export_dataset(df: pd.DataFrame, path: str):
-    """Export dataset as JSON for Go benchmark to consume."""
-    records = []
-    for _, row in df.iterrows():
-        records.append({
-            "ds": row["ds"].timestamp(),
-            "y": float(row["y"]),
-        })
-    with open(path, "w") as f:
-        json.dump(records, f)
-    print(f"  exported {len(records)} rows to {path}")
-
-
 def main():
-    n_days = int(sys.argv[1]) if len(sys.argv) > 1 else 1095
-    print(f"=== Python Prophet Benchmark ({n_days} days) ===\n")
+    print(f"=== Python Prophet Benchmark (Peyton Manning dataset) ===\n")
 
-    df = generate_dataset(n_days)
+    df = load_dataset()
+    print(f"  {len(df)} rows, {df['ds'].min().date()} to {df['ds'].max().date()}")
     export_dataset(df, "/tmp/prophet_bench_data.json")
 
     print("\n--- Fit ---")
@@ -120,10 +93,9 @@ def main():
     print("\n--- Cross-Validation ---")
     cv_result = benchmark_cv(df)
 
-    # Summary
     results = {
         "language": "python",
-        "n_days": n_days,
+        "n_days": len(df),
         "fit_mean_s": fit_result["fit_mean"],
         "predict_mean_s": pred_result["predict_mean"],
         "predict_n_rows": pred_result["n_rows"],

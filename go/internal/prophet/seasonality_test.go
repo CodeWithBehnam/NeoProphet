@@ -6,7 +6,8 @@ import (
 )
 
 func TestFourierFeatures(t *testing.T) {
-	// One full period should give cos(2pi)=1, sin(2pi)=0 for order 1
+	// Python formula: sin((j/period) * 2*pi*t), cos((j/period) * 2*pi*t)
+	// At t=0: sin(0)=0, cos(0)=1 for all orders
 	tvals := []float64{0, 182.625, 365.25}
 	period := 365.25
 	order := 2
@@ -17,21 +18,40 @@ func TestFourierFeatures(t *testing.T) {
 		t.Fatalf("expected %d elements, got %d", len(tvals)*cols, len(features))
 	}
 
-	// t=0: cos(0)=1, sin(0)=0, cos(0)=1, sin(0)=0
-	assertNear(t, features[0], 1.0, "t=0, cos(1)")
-	assertNear(t, features[1], 0.0, "t=0, sin(1)")
-	assertNear(t, features[2], 1.0, "t=0, cos(2)")
-	assertNear(t, features[3], 0.0, "t=0, sin(2)")
+	// t=0: sin(0)=0, cos(0)=1 for all orders
+	assertNear(t, features[0], 0.0, "t=0, sin(1)")
+	assertNear(t, features[1], 1.0, "t=0, cos(1)")
+	assertNear(t, features[2], 0.0, "t=0, sin(2)")
+	assertNear(t, features[3], 1.0, "t=0, cos(2)")
 
-	// t=365.25 (one full period): cos(2pi)=1, sin(2pi)=0
+	// t=365.25 (one full period): sin(2pi)=0, cos(2pi)=1
 	row2 := features[2*cols:]
-	assertNear(t, row2[0], 1.0, "t=365.25, cos(1)")
-	assertNear(t, row2[1], 0.0, "t=365.25, sin(1)")
+	assertNear(t, row2[0], 0.0, "t=365.25, sin(1)")
+	assertNear(t, row2[1], 1.0, "t=365.25, cos(1)")
 
-	// t=182.625 (half period): cos(pi)=-1, sin(pi)=0
+	// t=182.625 (half period): sin(pi)=0, cos(pi)=-1
 	row1 := features[cols:]
-	assertNear(t, row1[0], -1.0, "t=182.625, cos(1)")
-	assertNear(t, row1[1], 0.0, "t=182.625, sin(1)")
+	assertNear(t, row1[0], 0.0, "t=182.625, sin(1)")
+	assertNear(t, row1[1], -1.0, "t=182.625, cos(1)")
+}
+
+func TestFourierFeatures_MatchesPython(t *testing.T) {
+	// Verify against Python Prophet's fourier_series output
+	// Python: t = days since epoch, c = (j/period) * 2*pi*t
+	// sin(c), cos(c)
+	tDays := []float64{18262.0} // 2020-01-01 in days since epoch
+	period := 365.25
+	order := 1
+
+	features := FourierFeatures(tDays, period, order)
+
+	// Expected: sin((1/365.25) * 2*pi*18262), cos((1/365.25) * 2*pi*18262)
+	c := 1.0 / period * 2.0 * math.Pi * 18262.0
+	expectedSin := math.Sin(c)
+	expectedCos := math.Cos(c)
+
+	assertNear(t, features[0], expectedSin, "sin match")
+	assertNear(t, features[1], expectedCos, "cos match")
 }
 
 func TestMakeSeasonalityFeatures(t *testing.T) {
@@ -51,7 +71,6 @@ func TestMakeSeasonalityFeatures(t *testing.T) {
 		t.Fatalf("expected X length %d, got %d", len(tDays)*K, len(X))
 	}
 
-	// All additive
 	for i, v := range sA {
 		if v != 1.0 {
 			t.Errorf("sA[%d] = %f, want 1.0", i, v)

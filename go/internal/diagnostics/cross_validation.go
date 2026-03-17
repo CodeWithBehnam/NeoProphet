@@ -130,6 +130,8 @@ func CrossValidate(
 }
 
 // generateCutoffs produces the list of cutoff timestamps for cross-validation.
+// Matches Python Prophet's generate_cutoffs: starts at max-horizon, walks backward
+// by period, stops when cutoff < min+initial, then drops the last appended cutoff.
 func generateCutoffs(data []prophet.DataPoint, horizon, initial, period float64) []float64 {
 	if len(data) == 0 {
 		return nil
@@ -138,14 +140,20 @@ func generateCutoffs(data []prophet.DataPoint, horizon, initial, period float64)
 	minDS := data[0].DS
 	maxDS := data[len(data)-1].DS
 
-	var cutoffs []float64
 	cutoff := maxDS - horizon
-
-	for cutoff >= minDS+initial {
-		cutoffs = append(cutoffs, cutoff)
-		cutoff -= period
+	if cutoff < minDS {
+		return nil
 	}
 
-	sort.Float64s(cutoffs)
-	return cutoffs
+	var result []float64
+	result = append(result, cutoff)
+	for result[len(result)-1] >= minDS+initial {
+		cutoff -= period
+		result = append(result, cutoff)
+	}
+	// Drop the last cutoff (Python: result = result[:-1])
+	result = result[:len(result)-1]
+
+	sort.Float64s(result)
+	return result
 }

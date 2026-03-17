@@ -159,11 +159,11 @@ func (f *Forecaster) Fit(ctx context.Context, data []DataPoint) (*Model, error) 
 		"sigmas":          sigmas,
 	}
 
-	// Initial params
-	initK := initialSlope(t, yScaled)
+	// Initial params — match Python: line through first and last points
+	initK, initM := LinearGrowthInit(t, yScaled)
 	stanInit := map[string]any{
 		"k":         initK,
-		"m":         yScaled[0],
+		"m":         initM,
 		"delta":     makeZeros(S),
 		"beta":      makeZeros(K),
 		"sigma_obs": 1.0,
@@ -214,7 +214,6 @@ func (f *Forecaster) Predict(model *Model, ds []float64) []Forecast {
 	}
 
 	// Compute trend
-	S := len(model.Changepoints)
 	A := MakeChangepointMatrix(t, model.Changepoints)
 	var trend []float64
 
@@ -246,12 +245,16 @@ func (f *Forecaster) Predict(model *Model, ds []float64) []Forecast {
 			}
 		}
 
-		// Unscale trend
-		trendUnscaled := trend[i]*model.Scale.YScale + model.Scale.Floor + model.Scale.YMin
+		// Unscale: Python does trend * y_scale + floor
+		// For absmax: floor=0. For minmax: floor=y_min.
+		floor := model.Scale.Floor
+		if model.Config.Scaling == "minmax" {
+			floor = model.Scale.YMin
+		}
+		trendUnscaled := trend[i]*model.Scale.YScale + floor
 
 		// yhat = trend * (1 + mult) + add * y_scale
 		yhat := trendUnscaled*(1+multTerms) + addTerms*model.Scale.YScale
-		_ = S
 
 		forecasts[i] = Forecast{
 			DS:    ds[i],
@@ -328,38 +331,22 @@ func (f *Forecaster) autoSeasonalities(tDays []float64) []SeasonalitySpec {
 	return specs
 }
 
-func initialSlope(t, yScaled []float64) float64 {
+// LinearGrowthInit computes initial k (rate) and m (offset) matching Python Prophet.
+// Uses the first and last data points so the line passes through both.
+func LinearGrowthInit(t, yScaled []float64) (k, m float64) {
 	n := len(t)
 	if n < 2 {
-		return 0
+		return 0, 0
 	}
-	// Use first and last 10% of data to estimate initial slope
-	i0 := n / 10
-	if i0 == 0 {
-		i0 = 1
+	// Python: i0 = ds.idxmin(), i1 = ds.idxmax() — first and last by time
+	// Since data is sorted, i0=0, i1=n-1
+	T := t[n-1] - t[0]
+	if math.Abs(T) < 1e-12 {
+		return 0, yScaled[0]
 	}
-	i1 := n - i0
-
-	var sumY0, sumT0, sumY1, sumT1 float64
-	for i := 0; i < i0; i++ {
-		sumY0 += yScaled[i]
-		sumT0 += t[i]
-	}
-	for i := i1; i < n; i++ {
-		sumY1 += yScaled[i]
-		sumT1 += t[i]
-	}
-
-	meanY0 := sumY0 / float64(i0)
-	meanT0 := sumT0 / float64(i0)
-	meanY1 := sumY1 / float64(n-i1)
-	meanT1 := sumT1 / float64(n-i1)
-
-	dt := meanT1 - meanT0
-	if math.Abs(dt) < 1e-12 {
-		return 0
-	}
-	return (meanY1 - meanY0) / dt
+	k = (yScaled[n-1] - yScaled[0]) / T
+	m = yScaled[0] - k*t[0]
+	return k, m
 }
 
 func makeZeros(n int) []float64 {
