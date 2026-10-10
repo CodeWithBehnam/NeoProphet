@@ -3,8 +3,8 @@
 The same script is run once inside the NeoProphet project environment and once
 inside an isolated environment holding upstream ``prophet`` from PyPI. Both
 packages import as ``prophet``, so they cannot share an interpreter, and using
-one script keeps the measurement symmetric. Only APIs present in prophet 1.3.0
-and 1.5.0 are used.
+one script keeps the measurement symmetric. Only APIs present in both
+NeoProphet and upstream prophet 1.5.0 are used.
 
 Holdout design: the final ``horizon`` observations of each series are held out,
 the model is fitted on the rest, and ``predict`` is called on the held-out
