@@ -19,6 +19,7 @@ from prophet import Prophet  # noqa: E402
 from prophet import plot as plotmod  # noqa: E402
 from prophet.diagnostics import performance_metrics  # noqa: E402
 from prophet.plot import (  # noqa: E402
+    SkipSpecError,
     add_changepoints_to_plot,
     plot,
     plot_components,
@@ -589,3 +590,168 @@ def test_prophet_methods_forward_style_options() -> None:
         fig_components = m.plot_components(fcst, title="Parts", source=False)
     assert not any(t.startswith("What happens next") for t in _texts(fig))
     assert "Parts" in _texts(fig_components)
+
+
+# ---- skipped days and hours ---------------------------------------------------
+
+
+def test_weekly_profile_omits_skipped_days() -> None:
+    m, _ = fit_case("linear")
+    with no_warnings():
+        plot_weekly(m, skip_days="weekends")
+    labels = [t.get_text() for t in plt.gcf().axes[0].get_xticklabels()]
+    assert labels == ["Mon", "Tue", "Wed", "Thu", "Fri"]
+    plt.close("all")
+    with no_warnings():
+        plot_weekly(m, weekly_start=1, skip_days=["Wednesday", 6])
+    labels = [t.get_text() for t in plt.gcf().axes[0].get_xticklabels()]
+    assert labels == ["Mon", "Tue", "Thu", "Fri", "Sat"]
+
+
+def test_charts_close_the_gap_for_a_model_trained_on_every_day() -> None:
+    m, fcst = fit_case("linear")
+    with no_warnings():
+        fig = plot(m, fcst, skip_days="weekends")
+        parts = plot_components(m, fcst, skip_days=["Sat", "Sun"])
+        trend = plot_forecast_component(m, fcst, "trend", skip_days="weekends")
+    assert fig.axes[0].get_xscale() == "function"
+    assert parts.axes[0].get_xscale() == "function"
+    assert trend
+    # Rows on skipped days are not drawn, so the axis really is closed.
+    line = fig.axes[0].lines[0]
+    drawn = pd.to_datetime(np.asarray(line.get_xdata()))
+    assert not drawn.dayofweek.isin([5, 6]).any()
+
+
+def test_charts_close_the_gap_for_skipped_hours() -> None:
+    m, fcst = fit_case("subdaily")
+    with no_warnings():
+        fig = plot(m, fcst, skip_hours=range(0, 6))
+        parts = plot_components(m, fcst, skip_hours=range(0, 6))
+    assert fig.axes[0].get_xscale() == "function"
+    assert parts.axes[0].get_xscale() == "function"
+
+
+def test_bad_skip_specification_is_a_value_error() -> None:
+    m, fcst = fit_case("linear")
+    with pytest.raises(SkipSpecError):
+        plot(m, fcst, skip_days="Funday")
+    with pytest.raises(ValueError):
+        plot_components(m, fcst, skip_hours=range(24))
+
+
+def test_plotly_range_breaks_reach_every_timeline_panel(fitted: tuple[Prophet, pd.DataFrame]) -> None:
+    m, forecast = fitted
+    with no_warnings():
+        fig = plot_components_plotly(m, forecast, skip_days="weekends")
+        single = plot_forecast_component_plotly(m, forecast, "trend", skip_days="weekends")
+        weekly = plot_seasonality_plotly(m, "weekly", skip_days="weekends")
+    first = fig.layout.xaxis.rangebreaks
+    assert [list(b.bounds) for b in first] == [["sat", "mon"]]
+    assert [list(b.bounds) for b in single.layout.xaxis.rangebreaks] == [["sat", "mon"]]
+    assert [list(b.bounds) for b in weekly.layout.xaxis.rangebreaks] == [["sat", "mon"]]
+    # Yearly profiles do not line up with the calendar week, so they stay continuous.
+    yearly = [ax for name, ax in fig.layout.to_plotly_json().items() if name.startswith("xaxis")]
+    assert any("rangebreaks" not in ax for ax in yearly)
+
+
+# ---- glitch fixes: interval label placement, percent ticks, credit line --------
+
+
+def _label_boxes(fig: Figure, text: str) -> list[Any]:
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    return [
+        t.get_window_extent(renderer)
+        for ax in fig.axes
+        for t in ax.texts
+        if text in t.get_text()
+    ]
+
+
+@pytest.mark.parametrize("figsize", [(10, 6), (6, 4), (4, 3), (3, 2.5)])
+def test_interval_label_stays_inside_the_forecast_zone_and_the_axes(figsize: tuple[float, float]) -> None:
+    # 30 forecast days after 510 observed ones: a narrow zone, where the label used to straddle the boundary.
+    m, fcst = fit_case("linear")
+    fig = plot(m, fcst, figsize=figsize)
+    boxes = _label_boxes(fig, "interval")
+    ax = fig.axes[0]
+    boundary = float(ax.transData.transform((plotmod._dnum(m.history["ds"].max()), 0.0))[0])
+    axes_box = ax.get_window_extent()
+    assert len(boxes) <= 1
+    for box in boxes:  # dropped is fine; drawn must fit
+        assert box.x0 >= boundary
+        assert box.x1 <= axes_box.x1
+        assert box.y1 <= axes_box.y1 - 4
+        assert box.y0 >= axes_box.y0 + 4
+
+
+def test_interval_label_is_drawn_when_the_forecast_zone_is_wide() -> None:
+    m, fcst = fit_case("linear")
+    wide = m.predict(m.make_future_dataframe(periods=400))
+    fig = plot(m, wide, figsize=(10, 6))
+    assert len(_label_boxes(fig, "interval")) == 1
+
+
+def test_interval_label_is_dropped_rather_than_crossing_the_boundary() -> None:
+    m, fcst = fit_case("linear")
+    fig = plot(m, fcst, figsize=(3, 2.5))
+    assert _label_boxes(fig, "interval") == []
+
+
+def test_multiplicative_percent_axes_use_trimmed_percent_ticks_in_plotly() -> None:
+    m, fcst = fit_case("multiplicative")
+    components = plot_components_plotly(m, fcst)
+    formats = [
+        ax["tickformat"]
+        for name, ax in components.layout.to_plotly_json().items()
+        if name.startswith("yaxis") and "tickformat" in ax
+    ]
+    assert formats, "a multiplicative model has percent panels"
+    # d3's bare "%" prints six decimals ("6.000000%"); this trims trailing zeros.
+    assert set(formats) == {plotmod._PERCENT_TICKS}
+    assert plotmod._PERCENT_TICKS == ".2~%"
+    seasonal = plot_seasonality_plotly(m, "weekly")
+    assert seasonal.layout.yaxis.tickformat == plotmod._PERCENT_TICKS
+    assert seasonal.layout.yaxis.hoverformat == ".2%"
+
+
+def test_percent_tick_format_renders_without_trailing_zeros() -> None:
+    # The same specifier through d3-format's rules, reproduced with Python's own percent format.
+    def render(v: float) -> str:
+        text = f"{v * 100:.2f}".rstrip("0").rstrip(".")
+        return f"{text}%"
+
+    assert [render(v) for v in (0.06, 0.065, 0.0, -0.005)] == ["6%", "6.5%", "0%", "-0.5%"]
+
+
+def test_source_note_extends_the_default_credit_line() -> None:
+    m, fcst = fit_case("linear")
+    plain = [t.get_text() for t in plot(m, fcst).texts]
+    noted = [t.get_text() for t in plot(m, fcst, source_note="Future temperature: climatology for 9 days.").texts]
+    assert any("climatology for 9 days." in t for t in noted)
+    assert not any("climatology" in t for t in plain)
+    # An explicit credit line wins, and False omits it.
+    assert not any("climatology" in t for t in [x.get_text() for x in plot(m, fcst, source="Mine", source_note="x climatology").texts])
+    assert "Mine" in [t.get_text() for t in plot(m, fcst, source="Mine", source_note="x climatology").texts]
+
+
+def test_a_long_credit_line_wraps_inside_the_figure() -> None:
+    m, fcst = fit_case("linear")
+    note = "Future temperature: weather forecast for 15 days, then climatology (typical seasonal values) for 45 days"
+    fig = plot(m, fcst, figsize=(6, 4), skip_days="weekends", source_note=note)
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    source = next(t for t in fig.texts if "NeoProphet forecast" in t.get_text())
+    assert "\n" in source.get_text()
+    assert source.get_window_extent(renderer).x1 <= fig.bbox.x1
+
+
+def test_extreme_labels_at_the_ends_hang_inward() -> None:
+    fig, ax = plt.subplots()
+    plotmod._extrema_labels(ax, [0, 1, 2, 3, 4], np.array([5.0, 1.0, 2.0, 1.5, -3.0]), False)
+    aligns = {t.get_text(): t.get_horizontalalignment() for t in ax.texts}
+    assert aligns["+5"] == "left" and aligns["-3"] == "right"
+    fig2, ax2 = plt.subplots()
+    plotmod._extrema_labels(ax2, [0, 1, 2, 3, 4], np.array([1.0, 0.5, 5.0, -1.0, 2.0]), False)
+    assert {t.get_horizontalalignment() for t in ax2.texts} == {"center"}

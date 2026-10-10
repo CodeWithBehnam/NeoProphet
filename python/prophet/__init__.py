@@ -17,12 +17,16 @@ from prophet.quick import (
     FrequencyInferenceError,
     HorizonError,
     InsufficientDataError,
+    MissingRegressorValuesError,
     NonNumericValuesError,
+    RegressorError,
+    SkipDaysError,
     UnparseableDatesError,
     forecast,
     infer_frequency,
     normalise_input,
 )
+from prophet.plot import SkipAxis, SkipSpecError, skip_axis
 from prophet.tuning import TuningResult, tune
 
 __all__ = [
@@ -35,13 +39,19 @@ __all__ = [
     "FrequencyInferenceError",
     "HorizonError",
     "InsufficientDataError",
+    "MissingRegressorValuesError",
     "NonNumericValuesError",
     "Prophet",
+    "RegressorError",
+    "SkipAxis",
+    "SkipDaysError",
+    "SkipSpecError",
     "TuningResult",
     "UnparseableDatesError",
     "__version__",
     "forecast",
     "infer_frequency",
     "normalise_input",
+    "skip_axis",
     "tune",
 ]

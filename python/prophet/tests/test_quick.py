@@ -1,4 +1,6 @@
 import logging
+import subprocess
+import sys
 from typing import Any
 
 import matplotlib
@@ -16,13 +18,20 @@ from prophet import (  # noqa: E402
     FrequencyInferenceError,
     HorizonError,
     InsufficientDataError,
+    MissingRegressorValuesError,
     NonNumericValuesError,
+    RegressorError,
     UnparseableDatesError,
     forecast,
     infer_frequency,
     normalise_input,
 )
-from prophet.quick import horizon_to_periods, infer_frequency_details  # noqa: E402
+from prophet.quick import (  # noqa: E402
+    _plan_weather,
+    _temperature_for,
+    horizon_to_periods,
+    infer_frequency_details,
+)
 
 N = 10
 DATES = pd.date_range("2024-01-01", periods=N, freq="D")
@@ -427,3 +436,461 @@ def test_forecast_tune_skipped_when_every_param_is_explicit(
 def test_forecast_without_tune_has_no_tuning(daily_univariate_ts: pd.DataFrame) -> None:
     result = forecast(daily_univariate_ts, horizon=7, uncertainty_samples=0)
     assert result.tuning is None
+
+
+# ---- regressors ------------------------------------------------------------
+
+
+def promo_frame(n: int = 120) -> pd.DataFrame:
+    """A daily series that a binary promo lifts by 8, plus an unrelated price column."""
+    rng = np.random.default_rng(7)
+    ds = pd.date_range("2024-01-01", periods=n, freq="D")
+    promo = (np.arange(n) % 9 == 0).astype(float)
+    y = 20 + 0.05 * np.arange(n) + 8 * promo + rng.normal(0, 0.4, n)
+    return pd.DataFrame({"ds": ds, "y": y, "promo": promo, "price": rng.normal(size=n)})
+
+
+def future_frame(df: pd.DataFrame, periods: int = 7, **columns: float) -> pd.DataFrame:
+    ds = pd.date_range(df["ds"].max() + pd.Timedelta(days=1), periods=periods, freq="D")
+    return pd.DataFrame({"ds": ds, **{k: v for k, v in columns.items()}})
+
+
+def test_regressor_columns_with_future_values_and_options():
+    df = promo_frame()
+    future = future_frame(df, 7, promo=1.0, price=0.0)
+    result = forecast(
+        df,
+        horizon=7,
+        regressors=["promo", "price"],
+        future=future,
+        regressor_options={
+            "promo": {"mode": "multiplicative", "prior_scale": 5.0},
+            "price": {"standardize": False},
+        },
+        uncertainty_samples=0,
+    )
+    extra = result.model.extra_regressors
+    assert set(extra) == {"promo", "price"}
+    assert extra["promo"]["mode"] == "multiplicative"
+    assert extra["promo"]["prior_scale"] == 5.0
+    assert extra["price"]["standardize"] is False
+    assert extra["price"]["mode"] == "additive"
+    assert result.regressors == ("promo", "price")
+    assert len(result.forecast) == 7
+    values = result.regressor_values
+    assert values is not None
+    assert list(values.columns) == ["ds", "promo", "price"]
+    assert len(values) == len(df) + 7
+    assert values["promo"].iloc[-7:].eq(1.0).all()
+    assert "regressors: promo, price" in str(result.summary())
+    # The promo effect is learnt: promo days forecast well above the baseline.
+    baseline = forecast(
+        df.drop(columns=["promo", "price"]), horizon=7, uncertainty_samples=0
+    )
+    assert result.forecast["yhat"].mean() > baseline.forecast["yhat"].mean() + 3
+
+
+def test_regressor_columns_do_not_confuse_column_detection():
+    df = promo_frame().drop(columns="price").rename(columns={"ds": "when", "y": "sales"})
+    future = future_frame(df.rename(columns={"when": "ds"}), 3, promo=0.0)
+    result = forecast(
+        df, horizon=3, regressors=["promo"], future=future, uncertainty_samples=0
+    )
+    assert result.history.columns.tolist() == ["ds", "y"]
+    assert result.regressors == ("promo",)
+
+
+def test_regressor_series_mapping_covering_history_and_horizon():
+    df = promo_frame()
+    full = pd.date_range(df["ds"].min(), periods=len(df) + 5, freq="D")
+    promo = pd.Series((np.arange(len(full)) % 9 == 0).astype(float), index=full)
+    price = pd.Series(np.zeros(len(full)), index=full)
+    result = forecast(
+        df[["ds", "y"]],
+        horizon=5,
+        regressors={"promo": promo, "price": price},
+        uncertainty_samples=0,
+    )
+    assert result.regressors == ("promo", "price")
+    assert len(result.forecast) == 5
+    assert result.regressor_values is not None
+    assert len(result.regressor_values) == len(df) + 5
+
+
+def test_regressor_dataframe_with_ds_column_and_unordered_rows():
+    df = promo_frame()
+    full = pd.date_range(df["ds"].min(), periods=len(df) + 4, freq="D")
+    table = pd.DataFrame({"ds": full, "promo": (np.arange(len(full)) % 9 == 0) * 1.0})
+    result = forecast(
+        df[["ds", "y"]],
+        horizon=4,
+        regressors=table.sample(frac=1.0, random_state=0),
+        uncertainty_samples=0,
+    )
+    assert result.regressors == ("promo",)
+    assert result.regressor_values is not None
+    assert result.regressor_values["ds"].is_monotonic_increasing
+
+
+def test_boolean_regressor_values_become_flags():
+    df = promo_frame().assign(promo=lambda d: d["promo"].astype(bool))
+    future = future_frame(df, 3, promo=True)
+    result = forecast(
+        df, horizon=3, regressors=["promo"], future=future, uncertainty_samples=0
+    )
+    assert result.regressor_values is not None
+    assert result.regressor_values["promo"].dtype == np.float64
+
+
+def test_missing_future_values_name_the_timestamps():
+    df = promo_frame()
+    with pytest.raises(MissingRegressorValuesError) as info:
+        forecast(df, horizon=14, regressors=["promo"], uncertainty_samples=0)
+    message = str(info.value)
+    assert "'promo'" in message
+    assert "14 of 14 forecast timestamps" in message
+    assert "2024-04-30" in message  # the first forecast day
+    assert "and 9 more" in message
+    assert "future=" in message
+    assert isinstance(info.value, RegressorError)
+    assert isinstance(info.value, ValueError)
+
+
+def test_partly_missing_future_values_are_counted():
+    df = promo_frame()
+    future = future_frame(df, 5, promo=1.0).iloc[[0, 1, 3]]
+    with pytest.raises(MissingRegressorValuesError) as info:
+        forecast(
+            df, horizon=5, regressors=["promo"], future=future, uncertainty_samples=0
+        )
+    message = str(info.value)
+    assert "2 of 5 forecast timestamps" in message
+    assert "2024-04-32" not in message
+    assert "2024-05-02" in message and "2024-05-04" in message
+
+
+def test_gaps_in_history_say_how_many_rows():
+    df = promo_frame()
+    df.loc[[10, 11, 12], "promo"] = np.nan
+    future = future_frame(df, 2, promo=0.0)
+    with pytest.raises(MissingRegressorValuesError) as info:
+        forecast(
+            df, horizon=2, regressors=["promo"], future=future, uncertainty_samples=0
+        )
+    message = str(info.value)
+    assert "3 of 120 training timestamps" in message
+    assert "2024-01-11" in message
+
+
+def test_mapping_that_stops_at_the_end_of_history_fails_on_the_horizon():
+    df = promo_frame()
+    promo = pd.Series(df["promo"].to_numpy(), index=df["ds"])
+    with pytest.raises(MissingRegressorValuesError, match="7 of 7 forecast"):
+        forecast(
+            df[["ds", "y"]],
+            horizon=7,
+            regressors={"promo": promo},
+            uncertainty_samples=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"regressors": ["yhat"]}, "reserved"),
+        ({"regressors": ["trend"]}, "reserved"),
+        ({"regressors": ["nope"]}, "not a column.*Available columns"),
+        ({"regressors": ["promo", "promo"]}, "unique"),
+        ({"regressors": [3]}, "column names"),
+        ({"regressors": 3.5}, "list of column names"),
+        ({"regressors": ["y"]}, "reserved"),
+        ({"regressors": ["promo"], "regressor_options": {"price": {}}}, "not regressors"),
+        (
+            {"regressors": ["promo"], "regressor_options": {"promo": {"colour": 1}}},
+            "unknown setting",
+        ),
+        (
+            {"regressors": ["promo"], "regressor_options": {"promo": {"mode": "x"}}},
+            "mode",
+        ),
+        (
+            {"regressors": ["promo"], "regressor_options": {"promo": {"prior_scale": -1}}},
+            "Prior scale",
+        ),
+        ({"regressors": ["promo"], "regressor_options": {"promo": 5}}, "mapping"),
+    ],
+)
+def test_regressor_validation_errors(kwargs: dict[str, Any], match: str):
+    df = promo_frame()
+    future = future_frame(df, 3, promo=0.0, price=0.0)
+    with pytest.raises(RegressorError, match=match):
+        forecast(df, horizon=3, future=future, uncertainty_samples=0, **kwargs)
+
+
+def test_regressor_values_must_be_numeric_and_finite():
+    df = promo_frame()
+    words = df.assign(promo=["a", "b"] * 60)
+    with pytest.raises(RegressorError, match="not numeric"):
+        forecast(words, horizon=3, regressors=["promo"], uncertainty_samples=0)
+    infinite = df.assign(promo=np.where(np.arange(120) == 5, np.inf, 0.0))
+    with pytest.raises(RegressorError, match="infinite"):
+        forecast(infinite, horizon=3, regressors=["promo"], uncertainty_samples=0)
+    stamps = pd.date_range("2024-01-01", periods=130, freq="D")
+    with pytest.raises(RegressorError, match="DatetimeIndex"):
+        forecast(
+            df[["ds", "y"]],
+            horizon=3,
+            regressors={"promo": pd.Series(np.zeros(130))},
+            uncertainty_samples=0,
+        )
+    with pytest.raises(RegressorError, match="pandas Series"):
+        forecast(
+            df[["ds", "y"]],
+            horizon=3,
+            regressors={"promo": np.zeros(130)},  # type: ignore[dict-item]
+            uncertainty_samples=0,
+        )
+    dup = pd.Series(np.zeros(130), index=stamps.insert(0, stamps[0])[:130])
+    with pytest.raises(RegressorError, match="duplicate"):
+        forecast(
+            df[["ds", "y"]],
+            horizon=3,
+            regressors={"promo": dup},
+            uncertainty_samples=0,
+        )
+
+
+def test_column_regressors_need_a_dataframe():
+    series = pd.Series(np.arange(30.0), index=pd.date_range("2024-01-01", periods=30))
+    with pytest.raises(RegressorError, match="Series"):
+        forecast(series, horizon=3, regressors=["promo"], uncertainty_samples=0)
+
+
+def test_future_without_regressors_is_ignored_with_a_warning(
+    caplog: pytest.LogCaptureFixture,
+):
+    df = promo_frame()[["ds", "y"]]
+    with caplog.at_level(logging.WARNING, logger="prophet.quick"):
+        forecast(df, horizon=3, future=future_frame(df, 3), uncertainty_samples=0)
+    assert "future= ignored" in caplog.text
+
+
+def test_tune_receives_regressor_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import prophet.tuning as tuning
+
+    calls: dict[str, Any] = {}
+
+    def fake_tune(df: pd.DataFrame, **kwargs: Any) -> Any:
+        calls.update(kwargs)
+        calls["columns"] = list(df.columns)
+
+        class Best:
+            best_params = {"changepoint_prior_scale": 0.1}
+
+        return Best()
+
+    monkeypatch.setattr(tuning, "tune", fake_tune)
+    df = promo_frame()
+    forecast(
+        df,
+        horizon=3,
+        tune=True,
+        regressors=["promo"],
+        future=future_frame(df, 3, promo=0.0),
+        uncertainty_samples=0,
+    )
+    assert calls["regressors"] == ("promo",)
+    assert "promo" in calls["columns"]
+
+
+# ---- weather ----------------------------------------------------------------
+
+
+class FakeWeather:
+    """Stands in for prophet.weather.fetch_temperature and records its calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(
+        self, location: Any, start: Any, end: Any, *, freq: str = "daily", **_: Any
+    ) -> Any:
+        from prophet.weather import Location, WeatherResult
+
+        self.calls.append(
+            {
+                "location": location,
+                "start": pd.Timestamp(start),
+                "end": pd.Timestamp(end),
+                "freq": freq,
+            }
+        )
+        if freq == "daily":
+            ds = pd.date_range(
+                pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize(), freq="D"
+            )
+            temperature = (ds - pd.Timestamp("2024-01-01")).days.to_numpy() * 0.1
+        else:
+            first = pd.Timestamp(start).floor("h")
+            last = pd.Timestamp(end).ceil("h")
+            if last == last.normalize():
+                last = last + pd.Timedelta(hours=23)
+            ds = pd.date_range(first, last, freq="h")
+            temperature = (ds - first).total_seconds().to_numpy() / 3600.0
+        source = np.where(ds >= pd.Timestamp("2024-04-25"), "climatology", "archive")
+        return WeatherResult(
+            location=Location("Testville, England", 51.5, -0.1, "Europe/London"),
+            frame=pd.DataFrame(
+                {"ds": ds, "temperature": temperature, "source": source}
+            ),
+        )
+
+
+@pytest.fixture
+def fake_weather(monkeypatch: pytest.MonkeyPatch) -> FakeWeather:
+    weather = pytest.importorskip("prophet.weather")
+    fake = FakeWeather()
+    monkeypatch.setattr(weather, "fetch_temperature", fake)
+    return fake
+
+
+def test_weather_adds_a_temperature_regressor_and_keeps_the_result(
+    fake_weather: FakeWeather,
+):
+    df = promo_frame()[["ds", "y"]]
+    result = forecast(df, horizon=10, weather="Testville", uncertainty_samples=0)
+    assert result.regressors == ("temperature",)
+    assert "temperature" in result.model.extra_regressors
+    assert len(result.forecast) == 10
+    call = fake_weather.calls[0]
+    assert call["location"] == "Testville"
+    assert call["freq"] == "daily"
+    assert call["start"] == df["ds"].min()
+    assert call["end"] == df["ds"].max() + pd.Timedelta(days=10)
+    # The WeatherResult is kept whole, so charts can tell measured from climatology.
+    assert result.weather is not None
+    assert result.weather.location.name == "Testville, England"
+    assert set(result.weather.frame["source"]) == {"archive", "climatology"}
+    values = result.regressor_values
+    assert values is not None
+    assert len(values) == len(df) + 10  # history rows and forecast rows
+    expected = result.weather.frame.set_index("ds")["temperature"].reindex(values["ds"])
+    np.testing.assert_allclose(values["temperature"].to_numpy(), expected.to_numpy())
+    text = str(result.summary())
+    assert "temperature" in text and "Testville, England" in text
+    assert result.summary().weather_location == "Testville, England"
+
+
+def test_weather_accepts_coordinates_and_combines_with_regressors(
+    fake_weather: FakeWeather,
+):
+    df = promo_frame()
+    future = future_frame(df, 5, promo=0.0)
+    result = forecast(
+        df[["ds", "y", "promo"]],
+        horizon=5,
+        weather=(51.5, -0.12),
+        regressors=["promo"],
+        future=future,
+        regressor_options={"temperature": {"prior_scale": 2.0}},
+        uncertainty_samples=0,
+    )
+    assert fake_weather.calls[0]["location"] == (51.5, -0.12)
+    assert result.regressors == ("promo", "temperature")
+    assert result.model.extra_regressors["temperature"]["prior_scale"] == 2.0
+
+
+def test_weather_with_skipped_days_only_uses_kept_timestamps(
+    fake_weather: FakeWeather,
+):
+    df = promo_frame()[["ds", "y"]]
+    result = forecast(
+        df, horizon=5, weather="Testville", skip_days="weekends", uncertainty_samples=0
+    )
+    assert not result.forecast["ds"].dt.dayofweek.isin({5, 6}).any()
+    assert result.regressor_values is not None
+    assert not result.regressor_values["ds"].dt.dayofweek.isin({5, 6}).any()
+    assert result.regressors == ("temperature",)
+
+
+def test_weather_for_sub_daily_data_is_hourly_and_interpolated(
+    fake_weather: FakeWeather,
+):
+    ds = pd.date_range("2024-03-04", periods=24 * 14, freq="30min")
+    series = pd.Series(
+        10 + np.sin(np.arange(len(ds)) / 6.0), index=ds
+    )
+    result = forecast(series, horizon=6, weather="Testville", uncertainty_samples=0)
+    assert fake_weather.calls[0]["freq"] == "hourly"
+    values = result.regressor_values
+    assert values is not None
+    half_hour = values[values["ds"].dt.minute == 30]["temperature"].to_numpy()
+    on_hour = values[values["ds"].dt.minute == 0]["temperature"].to_numpy()
+    # A half hour lies midway between its hourly neighbours (the fake rises 1 per hour).
+    np.testing.assert_allclose(half_hour[:5], on_hour[:5] + 0.5)
+
+
+def test_weather_for_weekly_data_averages_each_week(fake_weather: FakeWeather):
+    weekly = pd.Series(
+        np.arange(40.0), index=pd.date_range("2024-01-07", periods=40, freq="W-SUN")
+    )
+    result = forecast(weekly, horizon=2, weather="Testville", uncertainty_samples=0)
+    assert fake_weather.calls[0]["freq"] == "daily"
+    values = result.regressor_values
+    assert values is not None
+    # The fake temperature is 0.1 per day since 1 January; the week ending Sunday 7 January
+    # covers 1 to 7 January, so its mean is the value for 4 January.
+    assert values["temperature"].iloc[0] == pytest.approx(0.3)
+    assert values["temperature"].iloc[1] == pytest.approx(1.0)
+
+
+def test_weather_plans_for_month_labels():
+    month_end = pd.DatetimeIndex(pd.date_range("2024-01-31", periods=3, freq="ME"))
+    plan = _plan_weather(month_end, "ME")
+    assert plan.kind == "daily"
+    assert plan.start == pd.Timestamp("2024-01-01")
+    assert plan.end == pd.Timestamp("2024-03-31")
+    month_start = pd.DatetimeIndex(pd.date_range("2024-01-01", periods=3, freq="MS"))
+    plan = _plan_weather(month_start, "MS")
+    assert plan.start == pd.Timestamp("2024-01-01")
+    assert plan.end == pd.Timestamp("2024-03-31")
+    frame = pd.DataFrame(
+        {
+            "ds": pd.date_range("2024-01-01", "2024-03-31", freq="D"),
+            "temperature": 1.0,
+        }
+    )
+    assert _temperature_for(plan, frame).tolist() == [1.0, 1.0, 1.0]
+
+
+def test_weather_errors_and_clashes():
+    df = promo_frame()
+    with pytest.raises(RegressorError, match="place name"):
+        forecast(df, horizon=3, weather=42, uncertainty_samples=0)  # type: ignore[arg-type]
+    with pytest.raises(RegressorError, match="place name"):
+        forecast(df, horizon=3, weather="  ", uncertainty_samples=0)
+    with pytest.raises(RegressorError, match="clashes"):
+        forecast(
+            df.rename(columns={"price": "temperature"}),
+            horizon=3,
+            weather="London",
+            regressors=["temperature"],
+            uncertainty_samples=0,
+        )
+
+
+def test_missing_weather_module_fails_only_when_weather_is_used(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(sys.modules, "prophet.weather", None)
+    df = promo_frame()[["ds", "y"]]
+    assert len(forecast(df, horizon=3, uncertainty_samples=0).forecast) == 3
+    with pytest.raises(ImportError, match="prophet.weather"):
+        forecast(df, horizon=3, weather="London", uncertainty_samples=0)
+
+
+def test_importing_prophet_does_not_import_the_weather_module():
+    code = "import sys, prophet; assert 'prophet.weather' not in sys.modules"
+    subprocess.run([sys.executable, "-c", code], check=True)

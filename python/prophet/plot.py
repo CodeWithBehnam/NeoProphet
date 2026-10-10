@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import textwrap
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, cast
 
@@ -30,7 +31,7 @@ import pandas as pd
 from prophet.diagnostics import performance_metrics
 
 if TYPE_CHECKING:
-    from typing import Literal, Sequence, TypeVar, type_check_only
+    from typing import Iterable, Literal, Sequence, TypeVar, type_check_only
     from typing_extensions import NotRequired, TypedDict
 
     from prophet.forecaster import Prophet
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     import plotly.graph_objs as go
 
     _AxT = TypeVar('_AxT', bound=plt.Axes)
+    _SkipSpec = str | int | Iterable[str | int] | None
 
     @type_check_only
     class _PlotlyProps(TypedDict):
@@ -65,7 +67,7 @@ try:
     )
     from matplotlib.patches import Rectangle
     from matplotlib.text import Text
-    from matplotlib.ticker import FuncFormatter
+    from matplotlib.ticker import Formatter, FuncFormatter, Locator
     from matplotlib.transforms import ScaledTranslation
 
     from pandas.plotting import deregister_matplotlib_converters
@@ -100,6 +102,8 @@ _SANS_STACK = ('Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans')
 _SERIF_STACK = ('Georgia', 'Charter', 'Times New Roman', 'DejaVu Serif')
 _PLOTLY_SANS = '"Helvetica Neue", Helvetica, Arial, "DejaVu Sans", sans-serif'
 _PLOTLY_SERIF = 'Georgia, Charter, "Times New Roman", "DejaVu Serif", serif'
+# d3 format for multiplicative axes: two decimals at most, trailing zeros trimmed (6%, 6.5%, not 6.000000%).
+_PERCENT_TICKS = '.2~%'
 _PLOTLY_BAND = 'rgba(153, 15, 61, 0.25)'  # ACCENT at BAND_ALPHA
 
 _TITLE_PT = 17.0
@@ -126,6 +130,391 @@ def _sans() -> list[str]:
 
 def _serif() -> list[str]:
     return list(_installed_families(_SERIF_STACK))
+
+
+# ----------------------------------------------------------------------------
+# Skipped days and hours
+# ----------------------------------------------------------------------------
+#
+# When a series never has data on some weekdays or hours (weekends, nights),
+# a continuous time axis shows a hole there. ``skip_axis`` builds a mapping
+# from timestamps to a compressed position in which the skipped periods take
+# no room, so Friday is joined to Monday. The mapping is analytic: it only
+# needs the weekly pattern of kept hours, so it has no range limits and no
+# lookup tables. Positions are measured in "kept days" (24 kept hours each).
+
+class SkipSpecError(ValueError):
+    """``skip_days`` or ``skip_hours`` cannot be understood."""
+
+
+_WEEKDAY_NAMES = ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')
+_WEEKDAY_ALIASES: dict[str, int] = {
+    **{name: i for i, name in enumerate(_WEEKDAY_NAMES)},
+    **{name[:3]: i for i, name in enumerate(_WEEKDAY_NAMES)},
+    'tues': 1, 'weds': 2, 'thur': 3, 'thurs': 3,
+}
+_WEEKEND = frozenset({5, 6})
+# A Monday, so the hour of the week is simply the hours elapsed modulo 168.
+_MONDAY = pd.Timestamp('2000-01-03')
+_HOURS_PER_WEEK = 168
+
+
+def _weekday_numbers(item: object) -> frozenset[int]:
+    if isinstance(item, (bool, np.bool_)):
+        raise SkipSpecError(f'skip_days entries must be weekday names or numbers, got {item!r}.')
+    if isinstance(item, (int, np.integer)):
+        if 0 <= int(item) <= 6:
+            return frozenset({int(item)})
+        raise SkipSpecError(f'Weekday number {int(item)} is out of range; use 0 (Monday) to 6 (Sunday).')
+    if isinstance(item, str):
+        key = item.strip().lower()
+        if key in ('weekend', 'weekends'):
+            return _WEEKEND
+        number = _WEEKDAY_ALIASES.get(key, _WEEKDAY_ALIASES.get(key.removesuffix('s')))
+        if number is not None:
+            return frozenset({number})
+        raise SkipSpecError(
+            f'Unknown weekday {item!r}. Use names such as "Sat" or "Saturday", numbers from 0 (Monday) '
+            'to 6 (Sunday), or "weekends".')
+    raise SkipSpecError(f'skip_days entries must be weekday names or numbers, got {type(item).__name__}.')
+
+
+def _entries(spec: object) -> list[object]:
+    if isinstance(spec, (str, int, np.integer)):
+        return [spec]
+    try:
+        return list(cast('Iterable[object]', spec))
+    except TypeError:
+        raise SkipSpecError(f'Expected a name, a number or a list of them, got {type(spec).__name__}.') from None
+
+
+def parse_skip_days(spec: object) -> frozenset[int]:
+    """Weekday numbers (Monday is 0, Sunday is 6) from a flexible description.
+
+    Accepts one entry or a collection of: full or short names in any case
+    ("Saturday", "sat", "Sat"), numbers 0 to 6, and the shortcut "weekends".
+
+    Raises
+    ------
+    SkipSpecError: For an unknown name, an out-of-range number, or when every
+        day of the week would be skipped.
+
+    Examples
+    --------
+    >>> sorted(parse_skip_days("weekends"))
+    [5, 6]
+    >>> sorted(parse_skip_days(["Mon", 2, "friday"]))
+    [0, 2, 4]
+    """
+    if spec is None:
+        return frozenset()
+    days = frozenset().union(*(_weekday_numbers(item) for item in _entries(spec)))
+    if len(days) == 7:
+        raise SkipSpecError('skip_days covers every day of the week, which leaves nothing to draw or forecast.')
+    return days
+
+
+def parse_skip_hours(spec: object) -> frozenset[int]:
+    """Hours of the day (0 to 23) from one number or a collection such as ``range(0, 8)``.
+
+    Raises
+    ------
+    SkipSpecError: For a non-integer or out-of-range hour, or when every hour
+        of the day would be skipped.
+    """
+    if spec is None:
+        return frozenset()
+    hours: set[int] = set()
+    for item in _entries(spec):
+        if isinstance(item, (bool, np.bool_)) or not isinstance(item, (int, np.integer)):
+            raise SkipSpecError(f'skip_hours entries must be whole hours from 0 to 23, got {item!r}.')
+        if not 0 <= int(item) <= 23:
+            raise SkipSpecError(f'Hour {int(item)} is out of range; use 0 to 23.')
+        hours.add(int(item))
+    if len(hours) == 24:
+        raise SkipSpecError('skip_hours covers every hour of the day, which leaves nothing to draw or forecast.')
+    return frozenset(hours)
+
+
+@lru_cache(maxsize=None)
+def _week_profile(skip_days: frozenset[int], skip_hours: frozenset[int]) -> tuple[np.ndarray, np.ndarray, float]:
+    """Kept hours accumulated before each hour of the week (length 169), whether each hour is kept, and the total."""
+    keep = np.array([(h // 24) not in skip_days and (h % 24) not in skip_hours for h in range(_HOURS_PER_WEEK)])
+    cumulative = np.concatenate([[0.0], np.cumsum(keep)])
+    cumulative.flags.writeable = False
+    keep.flags.writeable = False
+    return cumulative, keep, float(cumulative[-1])
+
+
+def _kept_hours(hours: np.ndarray, skip_days: frozenset[int], skip_hours: frozenset[int]) -> np.ndarray:
+    """Kept hours elapsed since the origin Monday, for hours elapsed in real time. Non-finite values stay NaN."""
+    cumulative, keep, per_week = _week_profile(skip_days, skip_hours)
+    hours = np.asarray(hours, dtype=float)
+    finite = np.isfinite(hours)
+    safe = np.where(finite, hours, 0.0)
+    week = np.floor(safe / _HOURS_PER_WEEK)
+    rest = safe - week * _HOURS_PER_WEEK
+    slot = np.minimum(np.floor(rest).astype(int), _HOURS_PER_WEEK - 1)
+    kept = week * per_week + cumulative[slot] + (rest - slot) * keep[slot]
+    return np.where(finite, kept, np.nan)
+
+
+def _real_hours(kept: np.ndarray, skip_days: frozenset[int], skip_hours: frozenset[int]) -> np.ndarray:
+    """Inverse of :func:`_kept_hours`. A position inside a skipped period resolves to the next kept time."""
+    cumulative, _, per_week = _week_profile(skip_days, skip_hours)
+    kept = np.asarray(kept, dtype=float)
+    finite = np.isfinite(kept)
+    safe = np.where(finite, kept, 0.0)
+    week = np.floor(safe / per_week)
+    rest = safe - week * per_week
+    slot = np.searchsorted(cumulative[:-1], rest, side='right') - 1
+    hours = week * _HOURS_PER_WEEK + slot + (rest - cumulative[slot])
+    return np.where(finite, hours, np.nan)
+
+
+def _naive_index(dates: object) -> pd.DatetimeIndex:
+    """Any date-like input as a timezone-naive DatetimeIndex (wall-clock time is kept)."""
+    if isinstance(dates, (pd.Series, pd.DatetimeIndex)):
+        index = pd.DatetimeIndex(dates)
+    else:
+        index = pd.DatetimeIndex(np.atleast_1d(np.asarray(dates)))
+    return index.tz_localize(None) if index.tz is not None else index
+
+
+@lru_cache(maxsize=None)
+def _ticker_classes() -> tuple[type, type, type]:
+    """Matplotlib tick helpers, defined lazily so importing this module never needs matplotlib."""
+
+    class SnappedDateLocator(AutoDateLocator):
+        """Calendar ticks on a warped date axis, one per drawn position (a tick in a skipped period is dropped
+        when a kept tick sits at the same place)."""
+
+        def __init__(self, axis: SkipAxis) -> None:
+            super().__init__(minticks=3, maxticks=8)
+            self._skip = axis
+
+        def __call__(self) -> np.ndarray:
+            return self._skip._distinct_date_numbers(np.asarray(super().__call__(), dtype=float))
+
+    class PositionLocator(Locator):
+        """Calendar ticks for an axis that holds :meth:`SkipAxis.to_x` positions."""
+
+        def __init__(self, axis: SkipAxis) -> None:
+            super().__init__()
+            self._skip = axis
+            self._inner = AutoDateLocator(minticks=3, maxticks=8)
+
+        def __call__(self) -> Sequence[float]:
+            low, high = self.axis.get_view_interval()  # pyrefly:ignore[missing-attribute]
+            return self.tick_values(low, high)
+
+        def tick_values(self, vmin: float, vmax: float) -> Sequence[float]:
+            first, last = self._skip.from_x([vmin, vmax]).to_pydatetime()
+            nums = np.asarray(self._inner.get_locator(first, last).tick_values(first, last), dtype=float)
+            stamps = pd.DatetimeIndex(num2date(nums)).tz_localize(None)
+            # A label is derived from the position, so a tick inside a skipped period could only be
+            # labelled with the next kept date. Dropping it keeps every label true.
+            return np.unique(self._skip.to_x(stamps[self._skip.keeps(stamps)])).tolist()
+
+    class PositionFormatter(Formatter):
+        """Date labels for an axis that holds :meth:`SkipAxis.to_x` positions."""
+
+        def __init__(self, axis: SkipAxis) -> None:
+            super().__init__()
+            self._skip = axis
+            self._concise = ConciseDateFormatter(AutoDateLocator(minticks=3, maxticks=8))
+
+        def format_ticks(self, values: Sequence[float]) -> list[str]:
+            stamps = self._skip.from_x(np.asarray(values, dtype=float))
+            return self._concise.format_ticks(date2num(stamps.to_pydatetime()))
+
+        def __call__(self, x: float, pos: int | None = None) -> str:
+            return self.format_ticks([x])[0]
+
+        def get_offset(self) -> str:
+            return self._concise.get_offset()
+
+    return SnappedDateLocator, PositionLocator, PositionFormatter
+
+
+@dataclass(frozen=True)
+class SkipAxis:
+    """A time axis that leaves out whole weekdays and hours of the day.
+
+    Build one with :func:`skip_axis`. The mapping from time to position is
+    piecewise linear: one kept hour is one 24th of a position unit, and a
+    skipped hour has no width, so a Friday and the following Monday are one
+    day apart. Positions are therefore measured in kept days.
+
+    Two ways to draw with it:
+
+    * Warped axis, data stay timestamps: call :meth:`apply` on a matplotlib
+      axes before or after plotting. Everything that takes dates (lines,
+      ``axvspan``, ``axvline``, text) keeps working unchanged.
+    * Plain numbers: plot ``to_x(dates)`` on an ordinary axis and install
+      :meth:`tick_locator` and :meth:`tick_formatter`, which turn positions
+      back into calendar dates.
+
+    Attributes
+    ----------
+    skip_days: Weekday numbers left out, Monday is 0.
+    skip_hours: Hours of the day left out.
+    first, last: First and last kept timestamp of the data the axis was
+        built from (None when built without data).
+    """
+
+    skip_days: frozenset[int] = frozenset()
+    skip_hours: frozenset[int] = frozenset()
+    first: pd.Timestamp | None = None
+    last: pd.Timestamp | None = None
+
+    @property
+    def active(self) -> bool:
+        """False when nothing is skipped (positions then equal elapsed days)."""
+        return bool(self.skip_days or self.skip_hours)
+
+    @property
+    def limits(self) -> tuple[float, float]:
+        """Positions of the first and last kept timestamp."""
+        if self.first is None or self.last is None:
+            raise SkipSpecError('This axis was built without data, so it has no limits.')
+        return float(self.to_x(self.first)), float(self.to_x(self.last))
+
+    def keeps(self, dates: object) -> np.ndarray:
+        """Boolean mask: True where a timestamp is not on a skipped day or hour."""
+        index = _naive_index(dates)
+        mask = np.ones(len(index), dtype=bool)
+        if self.skip_days:
+            mask &= ~np.isin(index.dayofweek, sorted(self.skip_days))
+        if self.skip_hours:
+            mask &= ~np.isin(index.hour, sorted(self.skip_hours))
+        return mask
+
+    def to_x(self, dates: object) -> np.ndarray | float:
+        """Compressed position of each timestamp, in kept days since an arbitrary Monday.
+
+        A timestamp inside a skipped period gets the position where the next
+        kept time starts. Returns a float for a single timestamp, otherwise an
+        array.
+        """
+        hours = ((_naive_index(dates) - _MONDAY) / pd.Timedelta(hours=1)).to_numpy(dtype=float)
+        x = _kept_hours(hours, self.skip_days, self.skip_hours) / 24.0
+        return float(x[0]) if np.ndim(dates) == 0 else x
+
+    def from_x(self, x: object) -> pd.DatetimeIndex:
+        """Timestamps for compressed positions (the inverse of :meth:`to_x`), rounded to the millisecond."""
+        hours = _real_hours(np.atleast_1d(np.asarray(x, dtype=float)) * 24.0, self.skip_days, self.skip_hours)
+        return pd.DatetimeIndex(_MONDAY + pd.to_timedelta(hours, unit='h')).round('ms')
+
+    def tick_locator(self) -> Locator:
+        """Locator for an axis holding :meth:`to_x` positions: calendar ticks, placed by position."""
+        return _ticker_classes()[1](self)
+
+    def tick_formatter(self) -> Formatter:
+        """Formatter for an axis holding :meth:`to_x` positions: dates in matplotlib's concise style."""
+        return _ticker_classes()[2](self)
+
+    def apply(self, ax: plt.Axes) -> plt.Axes:
+        """Warp the x axis of ``ax`` so skipped periods take no room; data stay timestamps.
+
+        Sets a function scale, calendar tick locations (a tick that falls in
+        a skipped period moves to the next kept time) and concise date labels.
+        """
+        origin = float(date2num(_MONDAY))
+
+        def forward(datenum: object) -> np.ndarray:
+            hours = (np.asarray(datenum, dtype=float) - origin) * 24.0
+            return _kept_hours(hours, self.skip_days, self.skip_hours) / 24.0
+
+        def inverse(position: object) -> np.ndarray:
+            hours = _real_hours(np.asarray(position, dtype=float) * 24.0, self.skip_days, self.skip_hours)
+            return hours / 24.0 + origin
+
+        ax.set_xscale('function', functions=(forward, inverse))
+        locator = _ticker_classes()[0](self)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(ConciseDateFormatter(locator))
+        return ax
+
+    def _distinct_date_numbers(self, ticks: np.ndarray) -> np.ndarray:
+        """One tick per drawn position. A tick in a skipped period (the 1st of a month that is a Saturday)
+        keeps its true date and is drawn where the skipped period was, unless a kept tick is already there."""
+        if ticks.size == 0:
+            return ticks
+        hours = (ticks - float(date2num(_MONDAY))) * 24.0
+        position = np.round(_kept_hours(hours, self.skip_days, self.skip_hours), 6)
+        _, keep, _ = _week_profile(self.skip_days, self.skip_hours)
+        slot = np.minimum(np.floor(np.mod(hours, _HOURS_PER_WEEK)).astype(int), _HOURS_PER_WEEK - 1)
+        order = np.lexsort((~keep[slot], position))  # by position, kept ticks first
+        first = np.concatenate([[True], position[order][1:] != position[order][:-1]])
+        return np.sort(ticks[order][first])
+
+
+def skip_axis(ds: object, *, skip_days: _SkipSpec = None, skip_hours: _SkipSpec = None) -> SkipAxis:
+    """Build the :class:`SkipAxis` for timestamps ``ds`` with some weekdays or hours left out.
+
+    Parameters
+    ----------
+    ds: The timestamps a chart covers (a Series, DatetimeIndex or list). Only
+        used to record the first and last kept timestamp and to check that
+        something remains after skipping.
+    skip_days: Weekdays to leave out: names ("Sat", "Saturday", "sat"),
+        numbers (Monday is 0, so Saturday is 5), the shortcut "weekends", or a
+        collection of these.
+    skip_hours: Hours of the day to leave out, for example ``range(0, 8)``.
+
+    Raises
+    ------
+    SkipSpecError: When a specification is invalid or every timestamp falls
+        on a skipped day or hour.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> axis = skip_axis(pd.date_range("2024-01-01", periods=14), skip_days="weekends")
+    >>> x = axis.to_x(pd.to_datetime(["2024-01-05", "2024-01-08"]))
+    >>> float(x[1] - x[0])  # Friday to Monday is one step
+    1.0
+    """
+    shell = SkipAxis(parse_skip_days(skip_days), parse_skip_hours(skip_hours))
+    index = _naive_index(ds)
+    index = index.dropna()
+    kept = index[shell.keeps(index)]
+    if kept.empty:
+        raise SkipSpecError('Every timestamp falls on a skipped day or hour, so nothing is left to draw.')
+    return replace(shell, first=kept.min(), last=kept.max())
+
+
+def _chart_axis(ds: object, skip_days: object, skip_hours: object) -> SkipAxis | None:
+    """The skip axis for a chart, or None when nothing is skipped."""
+    days, hours = parse_skip_days(skip_days), parse_skip_hours(skip_hours)
+    if not days and not hours:
+        return None
+    return skip_axis(ds, skip_days=days, skip_hours=hours)
+
+
+def _hour_runs(hours: Sequence[int]) -> list[tuple[int, int]]:
+    """Consecutive runs of hours as (first, last), wrapping past midnight."""
+    present = set(hours)
+    starts = [h for h in sorted(present) if (h - 1) % 24 not in present]
+    runs = []
+    for start in starts:
+        end = start
+        while (end + 1) % 24 in present:
+            end = (end + 1) % 24
+        runs.append((start, end))
+    return runs
+
+
+def _skip_note(axis: SkipAxis) -> str:
+    """A sentence for the credit line saying what the compressed time axis leaves out."""
+    parts = []
+    if axis.skip_days:
+        days = [f'{_WEEKDAY_NAMES[d].capitalize()}s' for d in sorted(axis.skip_days)]
+        parts.append(days[0] if len(days) == 1 else ', '.join(days[:-1]) + ' and ' + days[-1])
+    if axis.skip_hours:
+        parts.append(', '.join(f'{a:02d}:00 to {(b + 1) % 24:02d}:00' for a, b in _hour_runs(sorted(axis.skip_hours))))
+    return f'The time axis leaves out {" and ".join(parts)}.'
 
 
 # ----------------------------------------------------------------------------
@@ -507,7 +896,10 @@ def _style_axes(ax: plt.Axes) -> None:
             label.set_fontfamily(_sans())
 
 
-def _style_dates(ax: plt.Axes) -> None:
+def _style_dates(ax: plt.Axes, skip: SkipAxis | None = None) -> None:
+    if skip is not None:
+        skip.apply(ax)
+        return
     locator = AutoDateLocator(minticks=3, maxticks=8)
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(ConciseDateFormatter(locator))
@@ -577,13 +969,17 @@ def _claim(text: Text, taken: list[object], series: Sequence[np.ndarray] = (), p
     return True
 
 
-def _fit_inside(ax: plt.Axes, text: Text) -> bool:
-    """Centre the text on its anchor, or hang it off the anchor to keep it inside the axes."""
+def _fit_inside(ax: plt.Axes, text: Text, left: float | None = None) -> bool:
+    """Centre the text on its anchor, or hang it off the anchor to keep it inside the axes.
+
+    ``left`` is an optional screen x the text must not cross, for a label that has to stay right of a boundary.
+    """
     axes_box = ax.get_window_extent()
+    floor = axes_box.x0 if left is None else max(axes_box.x0, left)
     for ha in ('center', 'right', 'left'):
         text.set_horizontalalignment(ha)
         box = text.get_window_extent()
-        if box.x0 >= axes_box.x0 and box.x1 <= axes_box.x1:
+        if box.x0 >= floor and box.x1 <= axes_box.x1:
             return True
     return False
 
@@ -601,9 +997,17 @@ def _zones(ax: plt.Axes, x0: pd.Timestamp, boundary: pd.Timestamp, x1: pd.Timest
     ax.axvline(_dnum(boundary), color=INK_SOFT, lw=0.9, ls=(0, (3, 2)), zorder=2)
 
 
+def _midpoint(a: pd.Timestamp, b: pd.Timestamp, skip: SkipAxis | None) -> pd.Timestamp:
+    """Halfway between two dates; on a skip axis, halfway along the drawn width rather than in elapsed time."""
+    if skip is None:
+        return a + (b - a) / 2
+    return skip.from_x((skip.to_x(a) + skip.to_x(b)) / 2)[0]
+
+
 def _zone_labels(
     ax: plt.Axes, x0: pd.Timestamp, boundary: pd.Timestamp, x1: pd.Timestamp,
     taken: list[object], note: str | None, series: Sequence[np.ndarray] = (),
+    skip: SkipAxis | None = None,
 ) -> None:
     """Direct labels for the two zones and a note saying when the data ends.
 
@@ -619,7 +1023,7 @@ def _zone_labels(
         labels = [
             (_text_at(ax, x0, y, 'HISTORY', dx=6, transform=tr, ha='left', va=va, color=OBSERVED_TEXT, **common),
              (-np.inf, edge)),
-            (_text_at(ax, boundary + (x1 - boundary) / 2, y, 'FORECAST', transform=tr, ha='center', va=va,
+            (_text_at(ax, _midpoint(boundary, x1, skip), y, 'FORECAST', transform=tr, ha='center', va=va,
                       color=ACCENT, **common), (edge, np.inf)),
         ]
         if note:
@@ -695,7 +1099,10 @@ def _extrema_labels(ax: plt.Axes, x: Sequence[object], y: np.ndarray, multiplica
         if hi == lo and i == lo:
             continue
         ax.plot([x[i]], [y[i]], 'o', ms=6, color=ACCENT, zorder=5)
-        _text_at(ax, x[i], float(y[i]), _signed_effect(float(y[i]), multiplicative), dy=offset, ha='center',
+        # A point at either end hangs its label inward, so it clears the axis tick labels beside it.
+        share = i / max(len(y) - 1, 1)
+        ha = 'left' if share < 0.06 else 'right' if share > 0.94 else 'center'
+        _text_at(ax, x[i], float(y[i]), _signed_effect(float(y[i]), multiplicative), dy=offset, ha=ha,
                  va=va, fontsize=_LABEL_PT, fontweight='bold', color=INK, fontfamily=_sans(),
                  path_effects=_stroke(), zorder=6)
 
@@ -763,8 +1170,10 @@ def _open_axes(
         return cast('plt.Figure', ax.get_figure()), ax
     left_in = 0.9 + (0.3 if ylabel_room else 0)
     title_text, sub_text, head_in = _frame_layout(figsize, title, subtitle)
-    foot_in = 0.7 + (0.3 if xlabel_room else 0) + (0.25 if source else 0)
     w, h = figsize
+    # A long credit line (skip and weather notes) wraps to the page width instead of running off it.
+    source = _wrap(source, w - _TEXT_LEFT_IN - 0.3, _SOURCE_PT) if source else source
+    foot_in = 0.7 + (0.3 if xlabel_room else 0) + (0.25 + 0.15 * (_n_lines(source) - 1) if source else 0)
     fig = plt.figure(figsize=figsize, facecolor=PAPER)
     ax = fig.add_axes((left_in / w, foot_in / h, (w - left_in - _MARGIN_RIGHT_IN) / w,
                        max(h - head_in - foot_in, 0.5) / h))
@@ -797,24 +1206,46 @@ def _forecast_zone_args(m: Prophet, fcst: pd.DataFrame) -> tuple[pd.Timestamp, p
 
 def _interval_label(
     ax: plt.Axes, m: Prophet, future: pd.DataFrame, taken: list[object], series: Sequence[np.ndarray],
+    boundary: pd.Timestamp | None = None,
 ) -> None:
-    """Name the shaded band, above its highest point nearby, or leave it unnamed if there is no room."""
+    """Name the shaded band beside its highest or lowest point nearby, or leave it unnamed if there is no room.
+
+    The label stays inside the forecast zone (right of ``boundary``) and clear of the top and bottom edges of
+    the axes, so in a narrow chart it is dropped rather than straddling the boundary or touching the frame.
+    """
     upper = future['yhat_upper'].to_numpy(dtype=float)
+    lower = future['yhat_lower'].to_numpy(dtype=float)
     n = len(upper)
     window = max(n // 12, 1)
+    axes_box = ax.get_window_extent()
+    edge = None if boundary is None else float(ax.transData.transform((date2num(boundary), 0.0))[0])
+    margin = 6.0
     spots = [int(np.nanargmax(upper))] + [int(n * q) for q in (0.25, 0.5, 0.75)]
-    for spot in spots:
-        spot = min(max(spot, 0), n - 1)
-        lo, hi = max(spot - window, 0), min(spot + window + 1, n)
-        top = lo + int(np.nanargmax(upper[lo:hi]))
-        x, y = future['ds'].iloc[top], float(upper[top])
-        label = _text_at(ax, x, y, f'{m.interval_width:.0%} interval', dy=16, ha='center', va='bottom',
-                         fontsize=_NOTE_PT, fontweight='bold', color=ACCENT, fontfamily=_sans(), zorder=6)
-        if _fit_inside(ax, label) and _claim(label, taken, series):
-            ax.annotate('', xy=(x, y), xytext=(0, 14), textcoords='offset points',
-                        arrowprops={'arrowstyle': '-', 'color': ACCENT, 'lw': 0.7, 'shrinkA': 0, 'shrinkB': 0})
-            return
-        label.remove()
+    # Above the band first; below its lowest point as the second choice.
+    for above in (True, False):
+        for spot in spots:
+            spot = min(max(spot, 0), n - 1)
+            lo, hi = max(spot - window, 0), min(spot + window + 1, n)
+            if above:
+                top = lo + int(np.nanargmax(upper[lo:hi]))
+                y = float(upper[top])
+            else:
+                top = lo + int(np.nanargmin(lower[lo:hi]))
+                y = float(lower[top])
+            x = future['ds'].iloc[top]
+            sign = 1 if above else -1
+            label = _text_at(ax, x, y, f'{m.interval_width:.0%} interval', dy=16 * sign, ha='center',
+                             va='bottom' if above else 'top', fontsize=_NOTE_PT, fontweight='bold',
+                             color=ACCENT, fontfamily=_sans(), zorder=6)
+            if _fit_inside(ax, label, None if edge is None else edge + margin):
+                box = label.get_window_extent()
+                if box.y1 <= axes_box.y1 - margin and box.y0 >= axes_box.y0 + margin and _claim(label, taken, series):
+                    ax.annotate('', xy=(x, y), xytext=(0, 14 * sign), textcoords='offset points',
+                                arrowprops={'arrowstyle': '-', 'color': ACCENT, 'lw': 0.7, 'shrinkA': 0,
+                                            'shrinkB': 0})
+                    return
+            label.remove()
+
 
 def plot(
     m: Prophet,
@@ -831,6 +1262,9 @@ def plot(
     subtitle: str | bool | None = None,
     annotate: bool = True,
     source: str | bool | None = None,
+    skip_days: _SkipSpec = None,
+    skip_hours: _SkipSpec = None,
+    source_note: str | None = None,
 ) -> plt.Figure:
     """Plot the Prophet forecast.
 
@@ -858,15 +1292,31 @@ def plot(
         significant trend changepoints.
     source: Credit line under the figure, only when this function creates the
         figure. None writes a default, a string replaces it and False omits it.
+    skip_days: Weekdays to leave out of the time axis, so that for example
+        Friday is drawn next to Monday: names ("Sat", "Saturday"), numbers
+        (Monday is 0) or "weekends". Rows on those days are not drawn. See
+        :func:`skip_axis`.
+    skip_hours: Hours of the day to leave out of the time axis, for example
+        ``range(0, 8)`` for sub-daily data that has no data at night.
+    source_note: A sentence added to the default credit line, for facts the
+        data alone cannot tell, such as where an extra regressor's future
+        values came from. Ignored when ``source`` is given.
 
     Returns
     -------
     A matplotlib figure.
     """
     history = cast('pd.DataFrame', m.history)
+    skip = _chart_axis(fcst['ds'], skip_days, skip_hours)
+    if skip is not None:
+        history = history[skip.keeps(history['ds'])]
+        fcst = fcst[skip.keeps(fcst['ds'])]
     show_band = bool(uncertainty and m.uncertainty_samples and 'yhat_lower' in fcst)
     title_text, sub_text = _headline_texts(title, subtitle, lambda: _forecast_headline(m, fcst, show_band))
-    source_text = _source_text(source, f'NeoProphet forecast: {_obs_phrase(m)}')
+    sentences = [part.rstrip('.') for part in (f'NeoProphet forecast: {_obs_phrase(m)}',
+                                               None if skip is None else _skip_note(skip), source_note) if part]
+    default_source = '. '.join(sentences) + ('.' if len(sentences) > 1 else '')
+    source_text = _source_text(source, default_source)
     xlabel_text = xlabel if xlabel != 'ds' else None
     ylabel_text = ylabel if ylabel != 'y' else None
     fig, ax = _open_axes(ax, figsize, title_text, sub_text, source_text,
@@ -904,7 +1354,7 @@ def plot(
     head = 0.05 + 0.08 * len(candidates)
     ax.set_ylim(lo - (0.05 * (hi - lo) if annotate else 0), hi + (hi - lo) * head / (1 - head))
     ax.set_xlim(x0, x1)
-    _style_dates(ax)
+    _style_dates(ax, skip)
     _axis_label(ax, 'x', xlabel_text)
     _axis_label(ax, 'y', ylabel_text)
     ax.yaxis.set_major_formatter(FuncFormatter(_fmt_tick))
@@ -923,7 +1373,7 @@ def plot(
     if zones is not None:
         _zones(ax, *zones)
         if annotate:
-            _zone_labels(ax, *zones, taken, f'data ends {_fmt_date(hist_end, span)}', series)
+            _zone_labels(ax, *zones, taken, f'data ends {_fmt_date(hist_end, span)}', series, skip)
     if annotate:
         for column, word in (('cap', 'Maximum capacity'), ('floor', 'Minimum capacity')):
             if column in fcst and plot_cap and (column == 'cap' or m.logistic_floor):
@@ -932,7 +1382,7 @@ def plot(
                                 zorder=6)
                 taken.append(_box(note, 2.0))
         if show_band and not future.empty:
-            _interval_label(ax, m, future, taken, series)
+            _interval_label(ax, m, future, taken, series, hist_end)
         tiers = [0.945 - 0.08 * i for i in range(len(candidates))]
         _changepoint_callouts(ax, m, fcst, taken, span, tiers)
     if include_legend:
@@ -953,6 +1403,8 @@ def plot_components(
     annotate: bool = True,
     panel_titles: bool = True,
     source: str | bool | None = None,
+    skip_days: _SkipSpec = None,
+    skip_hours: _SkipSpec = None,
 ) -> plt.Figure:
     """Plot the Prophet forecast components.
 
@@ -983,11 +1435,17 @@ def plot_components(
         data. If False, panels carry just their component name.
     source: Credit line under the figure. None writes a default, a string
         replaces it and False omits it.
+    skip_days: Weekdays to leave out of the time axes (names, numbers with
+        Monday as 0, or "weekends"). The weekly profile then shows only the
+        remaining days. See :func:`skip_axis`.
+    skip_hours: Hours of the day to leave out of the time axes and of the
+        daily profile.
 
     Returns
     -------
     A matplotlib figure.
     """
+    skip = _chart_axis(fcst['ds'], skip_days, skip_hours)
     # Identify components to be plotted
     components = ['trend']
     if m.train_holiday_names is not None and 'holidays' in fcst:
@@ -1027,7 +1485,8 @@ def plot_components(
         return f'What shapes the forecast: {listed}', f'Each panel isolates one part of the model. {unit}'
 
     title_text, sub_text = _headline_texts(title, None, auto_headline)
-    source_text = _source_text(source, f'NeoProphet forecast components: {_obs_phrase(m)}')
+    default_source = f'NeoProphet forecast components: {_obs_phrase(m)}'
+    source_text = _source_text(source, default_source if skip is None else f'{default_source}. {_skip_note(skip)}')
     left_in = 0.9
     title_wrapped, sub_wrapped, head_in = _frame_layout((w, 1), title_text, sub_text)
     foot_in = 0.3 + (0.25 if source_text else 0)
@@ -1054,6 +1513,7 @@ def plot_components(
             plot_forecast_component(
                 m=m, fcst=fcst, name='trend', ax=ax, uncertainty=uncertainty,
                 plot_cap=plot_cap, title=panel_title, annotate=annotate,
+                skip_days=skip_days, skip_hours=skip_hours,
             )
         elif plot_name in m.seasonalities:
             if (
@@ -1062,7 +1522,7 @@ def plot_components(
             ):
                 plot_weekly(
                     m=m, name=plot_name, ax=ax, uncertainty=uncertainty, weekly_start=weekly_start,
-                    title=panel_title, annotate=annotate,
+                    title=panel_title, annotate=annotate, skip_days=skip_days,
                 )
             elif plot_name == 'yearly' or m.seasonalities[plot_name]['period'] == 365.25:
                 plot_yearly(
@@ -1072,7 +1532,7 @@ def plot_components(
             else:
                 plot_seasonality(
                     m=m, name=plot_name, ax=ax, uncertainty=uncertainty,
-                    title=panel_title, annotate=annotate,
+                    title=panel_title, annotate=annotate, skip_days=skip_days, skip_hours=skip_hours,
                 )
         elif plot_name in [
             'holidays',
@@ -1082,6 +1542,7 @@ def plot_components(
             plot_forecast_component(
                 m=m, fcst=fcst, name=plot_name, ax=ax, uncertainty=uncertainty,
                 plot_cap=False, title=panel_title, annotate=annotate,
+                skip_days=skip_days, skip_hours=skip_hours,
             )
     return fig
 
@@ -1098,6 +1559,8 @@ def plot_forecast_component(
     title: str | bool | None = None,
     annotate: bool = True,
     source: str | bool | None = None,
+    skip_days: _SkipSpec = None,
+    skip_hours: _SkipSpec = None,
 ) -> Sequence[plt.Artist]:
     """Plot a particular component of the forecast.
 
@@ -1118,6 +1581,8 @@ def plot_forecast_component(
         (trend), or the callout on the largest holiday effect.
     source: Credit line, only when this function creates the figure. None
         writes a default, a string replaces it and False omits it.
+    skip_days, skip_hours: Weekdays and hours of the day to leave out of the
+        time axis, as for :func:`plot`.
 
     Returns
     -------
@@ -1126,6 +1591,9 @@ def plot_forecast_component(
     artists: list[plt.Artist] = []
     assert m.component_modes
     mult = name in m.component_modes['multiplicative']
+    skip = _chart_axis(fcst['ds'], skip_days, skip_hours)
+    if skip is not None:
+        fcst = fcst[skip.keeps(fcst['ds'])].reset_index(drop=True)
 
     def auto() -> tuple[str, str]:
         if name == 'trend':
@@ -1181,17 +1649,35 @@ def plot_forecast_component(
                          fontsize=_NOTE_PT, color=INK_SOFT, fontfamily=_sans(), path_effects=_stroke(), zorder=6)
     _set_ylim(ax, drawn, bottom=pad_bottom, top=pad_top)
     ax.set_xlim(x0, x1)
-    _style_dates(ax)
+    _style_dates(ax, skip)
     ax.yaxis.set_major_formatter(FuncFormatter(_fmt_tick))
     if annotate and name == 'trend':
         taken: list[object] = []
         if zones is not None:
             series = [_series_px(ax, fcst_t, arr) for arr in drawn]
-            _zone_labels(ax, *zones, taken, None, series)
+            _zone_labels(ax, *zones, taken, None, series, skip)
         _changepoint_callouts(ax, m, fcst, taken, x1 - x0, [], with_text=False)
     if mult:
         ax = set_y_as_percent(ax)
     return artists
+
+
+def _blank_points(
+    ds: pd.Series, name: str, period: float, skip_days: object, skip_hours: object,
+) -> np.ndarray:
+    """Points of a seasonal cycle that fall on skipped days or hours and so should not be drawn.
+
+    A weekly cycle (period 7) is blanked by both weekday and hour, a daily one
+    (period 1) by hour only. Other periods do not line up with the calendar,
+    so nothing is blanked.
+    """
+    days, hours = parse_skip_days(skip_days), parse_skip_hours(skip_hours)
+    weekly = name == 'weekly' or period == 7
+    daily = name == 'daily' or period == 1
+    if not (weekly or daily) or not (days or hours):
+        return np.zeros(len(ds), dtype=bool)
+    shell = SkipAxis(days if weekly else frozenset(), hours)
+    return ~shell.keeps(ds)
 
 
 def seasonality_plot_df(
@@ -1247,6 +1733,7 @@ def plot_weekly(
     title: str | bool | None = None,
     annotate: bool = True,
     source: str | bool | None = None,
+    skip_days: _SkipSpec = None,
 ) -> Sequence[plt.Artist]:
     """Plot the weekly component of the forecast.
 
@@ -1268,6 +1755,8 @@ def plot_weekly(
     annotate: Label the highest and lowest day with their effect.
     source: Credit line, only when this function creates the figure. None
         writes a default, a string replaces it and False omits it.
+    skip_days: Weekdays to leave out of the profile (names, numbers with
+        Monday as 0, or "weekends"), for data that never has them.
 
     Returns
     -------
@@ -1277,6 +1766,9 @@ def plot_weekly(
     # Compute weekly seasonality for a Sun-Sat sequence of dates.
     days = (pd.date_range(start='2017-01-01', periods=7) +
             pd.Timedelta(days=weekly_start))
+    skipped = parse_skip_days(skip_days)
+    if skipped:
+        days = days[~days.dayofweek.isin(sorted(skipped))]
     df_w = seasonality_plot_df(m, days)
     seas = m.predict_seasonal_components(df_w)
     mult = m.seasonalities[name]['mode'] == 'multiplicative'
@@ -1392,6 +1884,8 @@ def plot_seasonality(
     title: str | bool | None = None,
     annotate: bool = True,
     source: str | bool | None = None,
+    skip_days: _SkipSpec = None,
+    skip_hours: _SkipSpec = None,
 ) -> Sequence[plt.Artist]:
     """Plot a custom seasonal component.
 
@@ -1409,6 +1903,9 @@ def plot_seasonality(
     annotate: Label the highest and lowest point with their effect.
     source: Credit line, only when this function creates the figure. None
         writes a default, a string replaces it and False omits it.
+    skip_days, skip_hours: Weekdays and hours of the day the data never has.
+        The curve is left blank there when the seasonality repeats weekly
+        (days and hours) or daily (hours); other periods are drawn in full.
 
     Returns
     -------
@@ -1425,6 +1922,8 @@ def plot_seasonality(
     df_y = seasonality_plot_df(m, days)
     seas = m.predict_seasonal_components(df_y)
     mult = m.seasonalities[name]['mode'] == 'multiplicative'
+    blank = _blank_points(df_y['ds'], name, period, skip_days, skip_hours)
+    seas = seas.mask(pd.Series(blank, index=seas.index), axis=0) if blank.any() else seas
     values = seas[name].to_numpy(dtype=float)
     ax = _seasonal_axes(m, ax, figsize, title, source, lambda: _seasonality_headline(m, name, df_y['ds'], values))
     drawn: list[object] = [values]
@@ -1769,6 +2268,32 @@ def _plotly_axes_style() -> tuple[dict[str, object], dict[str, object]]:
     return x, y
 
 
+_PLOTLY_DAYS = ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun')
+
+
+def _plotly_rangebreaks(
+    skip_days: object, skip_hours: object, days: bool = True, hours: bool = True,
+) -> list[dict[str, object]]:
+    """Plotly ``rangebreaks`` that close the gaps left by skipped weekdays and hours.
+
+    Consecutive skipped days (or hours) become one break, wrapping past the end
+    of the week (or day) when needed, for example Saturday and Sunday are
+    ``bounds=['sat', 'mon']``.
+    """
+    breaks: list[dict[str, object]] = []
+    if days:
+        present = parse_skip_days(skip_days)
+        for start in sorted(d for d in present if (d - 1) % 7 not in present):
+            end = start
+            while (end + 1) % 7 in present:
+                end = (end + 1) % 7
+            breaks.append({'bounds': [_PLOTLY_DAYS[start], _PLOTLY_DAYS[(end + 1) % 7]]})
+    if hours:
+        for first, last in _hour_runs(sorted(parse_skip_hours(skip_hours))):
+            breaks.append({'pattern': 'hour', 'bounds': [first, (last + 1) % 24]})
+    return breaks
+
+
 def _axis_ref(row: int | None, kind: str = 'y') -> str:
     """Plotly axis id for a subplot row ('y', 'y2', ...)."""
     return kind if not row or row == 1 else f'{kind}{row}'
@@ -1810,6 +2335,8 @@ def plot_plotly(
     title: str | bool | None = None,
     subtitle: str | bool | None = None,
     annotate: bool = True,
+    skip_days: _SkipSpec = None,
+    skip_hours: _SkipSpec = None,
 ) -> go.Figure:
     """Plot the Prophet forecast with Plotly offline.
 
@@ -1841,11 +2368,16 @@ def plot_plotly(
     annotate: Draw the History and Forecast zone labels, the "data ends"
         note, the end-of-line "Forecast" label and callouts on the largest
         significant trend changepoints.
+    skip_days: Weekdays to leave out of the time axis (names, numbers with
+        Monday as 0, or "weekends"), drawn with Plotly range breaks so Friday
+        joins Monday.
+    skip_hours: Hours of the day to leave out of the time axis.
 
     Returns
     -------
     A Plotly Figure.
     """
+    breaks = _plotly_rangebreaks(skip_days, skip_hours)
     prediction_color = ACCENT
     error_color = _PLOTLY_BAND
     actual_color = OBSERVED
@@ -1986,6 +2518,8 @@ def plot_plotly(
     if block is not None:
         layout['title'] = block
     fig = go.Figure(data=data, layout=layout)
+    if breaks:
+        fig.update_xaxes(rangebreaks=breaks)
 
     zones = _forecast_zone_args(m, fcst)
     _add_plotly_zones(fig, zones, labels=annotate)
@@ -2018,6 +2552,8 @@ def plot_components_plotly(
     *,
     title: str | bool | None = None,
     panel_titles: bool = True,
+    skip_days: _SkipSpec = None,
+    skip_hours: _SkipSpec = None,
 ) -> go.Figure:
     """Plot the Prophet forecast components using Plotly.
     See plot_plotly() for Plotly setup instructions
@@ -2039,11 +2575,15 @@ def plot_components_plotly(
         False draws none.
     panel_titles: Give each panel a plain-English headline written from the
         data. If False, panels carry just their component name.
+    skip_days, skip_hours: Weekdays and hours of the day to leave out of the
+        time axes with Plotly range breaks. The weekly profile also drops the
+        skipped days and the daily profile the skipped hours.
 
     Returns
     -------
     A Plotly Figure.
     """
+    parse_skip_days(skip_days), parse_skip_hours(skip_hours)  # fail early on a bad specification
 
     # Identify components to plot and get their Plotly props
     components = {}
@@ -2114,9 +2654,22 @@ def plot_components_plotly(
         yaxis.update(title={'text': None})
         for trace in components[name]['traces']:
             fig.add_trace(trace, row=i + 1, col=1)
+        panel_breaks = _panel_rangebreaks(m, name, skip_days, skip_hours)
+        if panel_breaks:
+            xaxis.update(rangebreaks=panel_breaks)
         if name in ('trend', 'holidays') or name.startswith('extra_regressors_'):
             _add_plotly_zones(fig, zones, row=i + 1, labels=(name == 'trend'))
     return fig
+
+
+def _panel_rangebreaks(m: Prophet, name: str, skip_days: object, skip_hours: object) -> list[dict[str, object]]:
+    """Range breaks for one component panel: timelines skip both, repeating cycles only what lines up."""
+    if name in m.seasonalities:
+        period = float(m.seasonalities[name]['period'])
+        weekly = name == 'weekly' or period == 7
+        daily = name == 'daily' or period == 1
+        return _plotly_rangebreaks(skip_days, skip_hours, days=weekly, hours=weekly or daily)
+    return _plotly_rangebreaks(skip_days, skip_hours)
 
 
 def _component_figure(
@@ -2125,6 +2678,7 @@ def _component_figure(
     figsize: tuple[int, int],
     name: str,
     zones: tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp] | None = None,
+    breaks: list[dict[str, object]] | None = None,
 ) -> go.Figure:
     """A single-component Plotly figure in the editorial style."""
     title_text, sub_text = _headline_texts(
@@ -2148,6 +2702,8 @@ def _component_figure(
     if block is not None:
         layout.update(title=block)
     fig = go.Figure(data=props['traces'], layout=layout)
+    if breaks:
+        fig.update_xaxes(rangebreaks=breaks)
     _add_plotly_zones(fig, zones, labels=name == 'trend')
     return fig
 
@@ -2161,6 +2717,8 @@ def plot_forecast_component_plotly(
     figsize: tuple[int, int] = (900, 300),
     *,
     title: str | bool | None = None,
+    skip_days: _SkipSpec = None,
+    skip_hours: _SkipSpec = None,
 ) -> go.Figure:
     """Plot a particular component of the forecast using Plotly.
     See plot_plotly() for Plotly setup instructions
@@ -2177,13 +2735,16 @@ def plot_forecast_component_plotly(
     figsize: The plot's size (in px).
     title: Headline. None writes one from the data, a string replaces it and
         False draws none.
+    skip_days, skip_hours: Weekdays and hours of the day to leave out of the
+        time axis with Plotly range breaks.
 
     Returns
     -------
     A Plotly Figure.
     """
     props = get_forecast_component_plotly_props(m, fcst, name, uncertainty, plot_cap)
-    return _component_figure(props, title, figsize, name, zones=_forecast_zone_args(m, fcst))
+    return _component_figure(props, title, figsize, name, zones=_forecast_zone_args(m, fcst),
+                             breaks=_plotly_rangebreaks(skip_days, skip_hours))
 
 
 def plot_seasonality_plotly(
@@ -2193,6 +2754,8 @@ def plot_seasonality_plotly(
     figsize: tuple[int, int] = (900, 300),
     *,
     title: str | bool | None = None,
+    skip_days: _SkipSpec = None,
+    skip_hours: _SkipSpec = None,
 ) -> go.Figure:
     """Plot a custom seasonal component using Plotly.
     See plot_plotly() for Plotly setup instructions
@@ -2206,13 +2769,17 @@ def plot_seasonality_plotly(
     figsize: Set the plot's size (in px).
     title: Headline. None writes one from the data, a string replaces it and
         False draws none.
+    skip_days, skip_hours: Weekdays and hours of the day the data never has;
+        applied when the seasonality repeats weekly or daily, as for
+        :func:`plot_components_plotly`.
 
     Returns
     -------
     A Plotly Figure.
     """
     props = get_seasonality_plotly_props(m, name, uncertainty)
-    return _component_figure(props, title, figsize, name)
+    return _component_figure(props, title, figsize, name,
+                             breaks=_panel_rangebreaks(m, name, skip_days, skip_hours))
 
 
 def get_forecast_component_plotly_props(
@@ -2327,7 +2894,7 @@ def get_forecast_component_plotly_props(
                             zerolinecolor=zeroline_color)
     assert m.component_modes
     if name in m.component_modes['multiplicative']:
-        yaxis.update(tickformat='%', hoverformat='.2%')
+        yaxis.update(tickformat=_PERCENT_TICKS, hoverformat='.2%')
 
     if name == 'trend':
         headline = _trend_headline(m, fcst)
@@ -2425,7 +2992,7 @@ def get_seasonality_plotly_props(
     yaxis = go.layout.YAxis(title=go.layout.yaxis.Title(text=name),
                             zerolinecolor=zeroline_color)
     if m.seasonalities[name]['mode'] == 'multiplicative':
-        yaxis.update(tickformat='%', hoverformat='.2%')
+        yaxis.update(tickformat=_PERCENT_TICKS, hoverformat='.2%')
 
     if name == 'yearly' or period == 365.25:
         kind = 'yearly'
