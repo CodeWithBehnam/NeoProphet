@@ -1,74 +1,115 @@
+<div align="center">
 
-# NeoProphet: Prophet with a Go Wrapper Service
+# NeoProphet
 
-A fork of [Facebook Prophet](https://github.com/facebook/prophet) — the additive time series forecasting library — extended with a **high-performance Go wrapper service** for production serving.
+**Prophet forecasting that is easier to use, clearer to read and faster at scale.**
 
-The Go service wraps the same compiled Stan binary that Python uses, reimplements data preparation and prediction math in pure Go, and exposes a REST API. Benchmarks on real datasets show **~200x faster prediction** and **~10x faster cross-validation** with identical forecast accuracy.
+A drop-in fork of [Facebook Prophet](https://github.com/facebook/prophet) with a one-call API, self-explaining charts, built-in tuning, an experimental Apple Silicon GPU backend and a Go service for high-throughput serving.
 
-## Benchmark: Python vs Go
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-990F3D)
+![Licence MIT](https://img.shields.io/badge/licence-MIT-5C534C)
+![Apple Silicon MLX](https://img.shields.io/badge/Apple%20Silicon-MLX%20backend-8C8178)
 
-Tested on the Peyton Manning Wikipedia pageviews dataset (2,905 daily observations):
+</div>
 
-| Metric | Python | Go | Speedup |
-|--------|-------:|---:|--------:|
-| Fit (mean) | 0.363s | 0.252s | **1.4x** |
-| Predict (mean, 3270 rows) | 0.181s | 0.001s | **199x** |
-| Cross-validation (24 cutoffs) | 4.958s | 0.482s | **10.3x** |
-| CV MAPE | 0.0548 | 0.0547 | **0.2% relative diff** |
-
-Both implementations call the same compiled CmdStan binary for model fitting — the speedup comes from Go's native math for prediction and goroutine parallelism for cross-validation.
-
-## Architecture
-
-```
-python/
-  prophet/              # Original Python Prophet library
-    forecaster.py       # Core Prophet class — fit(), predict()
-    models.py           # CmdStanPy backend (shells out to Stan binary)
-    diagnostics.py      # cross_validation(), performance_metrics()
-  stan/
-    prophet.stan        # The Stan model (logistic + linear trend)
-go/
-  cmd/
-    server/             # HTTP service entrypoint
-    bench/              # Single-dataset benchmark CLI
-    bench_all/          # Multi-dataset benchmark CLI (JSON-driven)
-  internal/
-    cmdstan/            # exec.CommandContext wrapper + CSV parser
-    prophet/            # Go Prophet: Fourier, changepoints, scaling, trend
-    diagnostics/        # Parallel cross-validation via errgroup
-    pool/               # Bounded-concurrency worker pool
-  api/http/             # REST: /v1/fit, /v1/predict, /v1/cv, /v1/health
-R/                      # R package (CRAN-published)
-notebooks/
-  benchmark_python_vs_go.ipynb    # Single-dataset benchmark with visualizations
-  benchmark_all_datasets.ipynb    # All 8 datasets with hyperparameter tuning
-benchmarks/             # CLI benchmark scripts
-examples/               # Example datasets (CSV)
-```
-
-## Quick Start
-
-### Python
-
-```bash
-cd python
-uv pip install -e ".[dev]"
-uv run pytest prophet/tests
-```
+![A NeoProphet forecast of Peyton Manning Wikipedia page views: history and forecast zones, changepoint callouts and a plain-English title](.github/assets/forecast.png)
 
 ```python
-from prophet import Prophet
 import pandas as pd
+from prophet import forecast
 
 df = pd.read_csv("examples/example_wp_log_peyton_manning.csv")
-m = Prophet()
-m.fit(df)
-future = m.make_future_dataframe(periods=365)
-forecast = m.predict(future)
+result = forecast(df, horizon="12 months", country_holidays="US")
+result.plot()   # the chart above, title and callouts included
 ```
 
-### Go Service
+## Why NeoProphet
+
+Upstream Prophet is a great model with a dated developer experience. NeoProphet keeps the model and the API, and fixes the rest.
+
+| | Upstream Prophet 1.5.0 | NeoProphet |
+|---|---|---|
+| **Forecast in one call** | `Prophet()`, `fit`, `make_future_dataframe`, `predict` | `forecast(df, horizon="12 months")` |
+| **Input** | a DataFrame with `ds` and `y` columns | any date and value columns, a Series with a DatetimeIndex, timezone-aware dates, with clear errors for bad data |
+| **Frequency** | you pass `freq` yourself | detected automatically, including irregular series |
+| **Charts** | plain axes and a legend | data-derived titles, history and forecast zones, changepoint callouts, plain-English cross-validation labels |
+| **Tuning** | write your own grid search | `forecast(..., tune=True)` or `prophet.tune(df)`, parallel cross-validation |
+| **Many series** | fit them one by one | `fit_many()` fits 100 series in 1.3 s on an Apple Silicon GPU (experimental) |
+| **Serving** | not included | Go REST service sharing the same Stan model |
+| **Accuracy** | baseline | identical to upstream with default settings |
+
+Existing code keeps working: `from prophet import Prophet` is unchanged, and the new chart options are opt-out.
+
+## Install
+
+NeoProphet installs as the `prophet` package, so it replaces upstream Prophet in that environment. The Stan model is compiled on install, which takes a few minutes and needs a C++ toolchain (Xcode Command Line Tools on macOS).
+
+```bash
+uv add "prophet @ git+https://github.com/CodeWithBehnam/NeoProphet#subdirectory=python"
+```
+
+On Apple Silicon, add the MLX extra for the GPU backend:
+
+```bash
+uv add "prophet[mlx] @ git+https://github.com/CodeWithBehnam/NeoProphet#subdirectory=python"
+```
+
+## Feature tour
+
+### Charts that explain themselves
+
+Every chart says what it shows. Titles and subtitles come from the data (the peak month, the busiest weekday, how the forecast compares with the last period), the largest trend changes are called out, and multiplicative effects are shown as percentages.
+
+![NeoProphet components chart for Air Passengers: the trend rising since 1949 and a yearly pattern peaking in July](.github/assets/components.png)
+
+```python
+result = forecast(air_passengers, horizon="24 months", seasonality_mode="multiplicative")
+result.plot_components()
+```
+
+The same style applies to `plot_cross_validation_metric` and to the plotly charts. Turn the extras off when you want a plain chart:
+
+```python
+m.plot(fcst, title=False, annotate=False)
+```
+
+### Tuning with one flag
+
+```python
+result = forecast(df, horizon="12 months", tune=True)
+result.tuning.best_params   # chosen changepoint and seasonality prior scales, seasonality mode
+result.tuning.scores        # every combination with its cross-validation metrics
+```
+
+Tuning searches 33 combinations in parallel and took 6 to 21 seconds per example dataset (about 2 minutes for 18,000 five-minute rows). Cross-validation only sees the past, so treat the result as a starting point: on the 8 example datasets it beat untuned Prophet defaults on 4 and was worse on 2, and hand-chosen settings still won on most. Check `result.tuning.scores` and a holdout before trusting it.
+
+### Many series on an Apple Silicon GPU (experimental)
+
+![Fitting 100 series: upstream Prophet 33.4 s one by one, NeoProphet with CmdStan 33.3 s, NeoProphet MLX fit_many 1.3 s](.github/assets/throughput.png)
+
+```python
+from prophet.mlx_backend import fit_many
+
+models = fit_many(list_of_dataframes)   # one batched optimisation on the GPU
+forecasts = [m.predict(m.make_future_dataframe(30)) for m in models]
+```
+
+The MLX backend re-implements Prophet's MAP objective and solves many series at once. Forecasts stay within 0.6% of the data range of the CmdStan fits. It supports linear and flat growth (not logistic) and MAP only (no MCMC). For a single model use `Prophet(stan_backend="MLX")`; for small series such as Air Passengers (144 rows) and Retail Sales (293 rows), CmdStan is faster.
+
+### Faster predictions
+
+Predicting with uncertainty intervals is about 17% faster and cross-validation 13 to 22% faster than before, with bit-for-bit identical results for a fixed seed. Overall fit plus predict is within about 10% of upstream, because most of the time is spent inside CmdStan.
+
+### Go service
+
+The Go service wraps the same compiled Stan binary, reimplements data preparation and prediction maths in Go, and exposes a REST API. On the Peyton Manning dataset (2,905 daily observations):
+
+| Metric | Python | Go | Speed-up |
+|---|---:|---:|---:|
+| Fit (mean) | 0.363 s | 0.252 s | **1.4x** |
+| Predict (mean, 3,270 rows) | 0.181 s | 0.001 s | **199x** |
+| Cross-validation (24 cutoffs) | 4.958 s | 0.482 s | **10.3x** |
+| Cross-validation MAPE | 0.0548 | 0.0547 | **0.2% relative difference** |
 
 ```bash
 # Compile the Stan model (one-time)
@@ -92,63 +133,123 @@ curl -X POST http://localhost:8080/v1/predict \
   -d '{"model_id": "model-xxx", "periods": 365}'
 ```
 
-### Run Benchmarks
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/fit` | POST | Fit a Prophet model, returns model ID and parameters |
+| `/v1/predict` | POST | Generate forecasts from a fitted model |
+| `/v1/cv` | POST | Run cross-validation with parallel cutoffs |
+| `/v1/health` | GET | Service and Stan binary health check |
 
-```bash
-# Interactive notebook (recommended)
-cd python && uv run jupyter lab ../notebooks/benchmark_all_datasets.ipynb
+## Benchmarks against upstream Prophet
 
-# CLI benchmark
-bash benchmarks/run_benchmark.sh
-```
+[`notebooks/benchmark_vs_upstream.ipynb`](notebooks/benchmark_vs_upstream.ipynb) runs NeoProphet and upstream Prophet 1.5.0 (from PyPI, in an isolated environment) through the same runner on the 8 example datasets, scoring each on a held-out final period. Apple M2 Max, median of 3 runs:
+
+| Variant | Holdout accuracy against upstream | Fit and predict speed against upstream |
+|---|---|---|
+| NeoProphet, default settings | identical on all 8 datasets | 1.07x (within timing noise) |
+| NeoProphet, `tune=True` | better on 2, worse on 5 against hand-chosen settings | tuning adds 6 to 21 s per dataset |
+| NeoProphet, MLX backend | within about 5% RMSE on every dataset | 2.0x geometric mean, slower on the two smallest series |
+| NeoProphet, MLX `fit_many()` on 100 series | within 0.6% of the data range | **25x** (1.3 s against 33.4 s) |
+
+Regenerate the README charts from a benchmark run with `uv run python benchmarks/readme_charts.py --help`.
 
 ## Notebooks
 
 | Notebook | Description |
 |----------|-------------|
-| `benchmark_python_vs_go.ipynb` | Single-dataset (Peyton Manning) benchmark with forecast visualization, component plots, MAPE comparison |
-| `benchmark_all_datasets.ipynb` | All 8 example datasets with per-dataset hyperparameter tuning, forecasts gallery, aggregate speed comparison |
+| [`starter.ipynb`](notebooks/starter.ipynb) | Start here: one-call forecast, the full API, components and cross-validation |
+| [`benchmark_vs_upstream.ipynb`](notebooks/benchmark_vs_upstream.ipynb) | NeoProphet against upstream Prophet: accuracy, speed, tuning and MLX throughput |
+| [`benchmark_python_vs_go.ipynb`](notebooks/benchmark_python_vs_go.ipynb) | Python against the Go service on Peyton Manning, with forecast and component plots |
+| [`benchmark_all_datasets.ipynb`](notebooks/benchmark_all_datasets.ipynb) | All 8 example datasets with per-dataset hyperparameters and a forecasts gallery |
 
-## Go API Endpoints
+## Development
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/fit` | POST | Fit a Prophet model, returns model ID + parameters |
-| `/v1/predict` | POST | Generate forecasts from a fitted model |
-| `/v1/cv` | POST | Run cross-validation with parallel SHFs |
-| `/v1/health` | GET | Service + Stan binary health check |
+The repository root is a uv workspace. `uv sync` creates `.venv`, installs the local `prophet` package in editable mode (compiling the Stan model on first install), the dev tools and, on Apple Silicon, the MLX extra.
 
-## How It Works
+```bash
+git clone https://github.com/CodeWithBehnam/NeoProphet.git
+cd NeoProphet
+uv sync
+uv run --directory python pytest prophet/tests
+uv run --directory python pyrefly check prophet
+```
 
-Prophet decomposes time series into three components:
+Register the Jupyter kernel used by the notebooks:
+
+```bash
+uv run python -m ipykernel install --user --name neoprophet --display-name "NeoProphet (uv)"
+```
+
+Go:
+
+```bash
+cd go && go build ./... && go test ./...
+```
+
+## Architecture
+
+```
+python/
+  prophet/
+    quick.py            # forecast(): one-call API, input normalisation, frequency inference
+    tuning.py           # tune(): parallel cross-validated hyperparameter search
+    plot.py             # Default chart style (matplotlib and plotly)
+    forecaster.py       # Core Prophet class: fit(), predict()
+    models.py           # CmdStanPy backend (shells out to the Stan binary)
+    mlx_backend.py      # Experimental MLX backend and batched fit_many()
+    diagnostics.py      # cross_validation(), performance_metrics()
+  stan/
+    prophet.stan        # The Stan model (linear, logistic and flat trend)
+go/
+  cmd/
+    server/             # HTTP service entrypoint
+    bench/              # Single-dataset benchmark CLI
+    bench_all/          # Multi-dataset benchmark CLI (JSON-driven)
+  internal/
+    cmdstan/            # exec.CommandContext wrapper and CSV parser
+    prophet/            # Go Prophet: Fourier terms, changepoints, scaling, trend
+    diagnostics/        # Parallel cross-validation via errgroup
+    pool/               # Bounded-concurrency worker pool
+  api/http/             # REST: /v1/fit, /v1/predict, /v1/cv, /v1/health
+benchmarks/             # Upstream comparison runner, README chart generator, Python vs Go scripts
+notebooks/              # Starter and benchmark notebooks
+examples/               # Example datasets (CSV)
+R/                      # R package (CRAN-published upstream)
+```
+
+## How it works
+
+Prophet decomposes a time series into trend, seasonality and holidays:
 
 ```
 y(t) = g(t) + s(t) + h(t) + εₜ
 ```
 
-- **g(t)** — Trend: piecewise linear or logistic growth with automatic changepoints
-- **s(t)** — Seasonality: Fourier series for yearly, weekly, and daily patterns
-- **h(t)** — Holidays: indicator functions for irregular events
-- **εₜ** — Error: normally distributed noise
+- **g(t)**, trend: piecewise linear or logistic growth with automatic changepoints
+- **s(t)**, seasonality: Fourier series for yearly, weekly and daily patterns
+- **h(t)**, holidays: indicator functions for irregular events
+- **εₜ**, error: normally distributed noise
 
-Both Python and Go share the same Stan model for MAP estimation (L-BFGS optimizer). The Go service reimplements data preparation (Fourier features, changepoint matrices, y-scaling) and prediction math (trend + seasonal components) in native Go for speed.
+Python and Go share the same Stan model for MAP estimation (L-BFGS, with a Newton fallback). The Go service reimplements data preparation and prediction maths natively; the optional MLX backend reimplements the MAP objective to fit many series in one batch.
 
-## Key Hyperparameters
+### Key hyperparameters
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
-| `changepoint_prior_scale` (τ) | 0.05 | Trend flexibility — higher = more changepoints active |
-| `seasonality_prior_scale` (σ) | 10.0 | Seasonality strength — lower = smoother seasonal patterns |
-| `seasonality_mode` | additive | `multiplicative` for series where seasonal amplitude scales with trend |
+| `changepoint_prior_scale` | 0.05 | Trend flexibility: higher allows more trend changes |
+| `seasonality_prior_scale` | 10.0 | Seasonality strength: lower gives smoother seasonal patterns |
+| `seasonality_mode` | additive | `multiplicative` when seasonal swings grow with the trend |
 | `n_changepoints` | 25 | Number of potential changepoint locations |
 | `growth` | linear | `logistic` for saturating growth, `flat` for no trend |
 
+`tune=True` searches the first three for you.
+
 ## References
 
-- **Paper**: Taylor & Letham (2018). *Forecasting at Scale*. The American Statistician 72(1):37-45. [PeerJ Preprint](https://peerj.com/preprints/3190/).
-- **Original repo**: [github.com/facebook/prophet](https://github.com/facebook/prophet)
-- **Documentation**: [facebook.github.io/prophet](https://facebook.github.io/prophet/)
+- **Paper**: Taylor and Letham (2018). *Forecasting at Scale*. The American Statistician 72(1):37-45. [PeerJ Preprint](https://peerj.com/preprints/3190/).
+- **Upstream repository**: [github.com/facebook/prophet](https://github.com/facebook/prophet)
+- **Upstream documentation**: [facebook.github.io/prophet](https://facebook.github.io/prophet/)
 
-## License
+## Licence
 
-Prophet is licensed under the [MIT license](LICENSE).
+NeoProphet, like Prophet, is released under the [MIT licence](LICENSE). Prophet was created by Sean J. Taylor and Ben Letham at Facebook.
