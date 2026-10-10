@@ -8,11 +8,14 @@ from __future__ import annotations
 from abc import abstractmethod, ABC
 from dataclasses import dataclass
 from collections import OrderedDict
+from contextlib import contextmanager
 from enum import Enum
 import importlib.resources
+import json
 import pathlib
 import platform
-from typing import TYPE_CHECKING, Any, Sequence, cast
+import tempfile
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence, cast
 
 import numpy as np
 import pandas as pd
@@ -59,6 +62,40 @@ class ModelParams:
     delta: Sequence[float] | np.ndarray  # length S
     beta: Sequence[float] | np.ndarray  # length K
     sigma_obs: float
+
+
+def _to_json_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+@contextmanager
+def stan_json_files(
+    inits: Mapping[str, Any],
+    data: Mapping[str, Any],
+) -> Iterator[tuple[str, str]]:
+    """Write Stan inits and data to temporary JSON files; yield their paths.
+
+    cmdstanpy serialises dictionaries with stanio, which falls back to a
+    pure Python chunked encoder when ujson is absent. A single ``json.dumps``
+    call uses the C encoder instead and emits the same ``repr`` of each
+    float, so the values Stan reads are bit-for-bit unchanged. The files are
+    removed on exit, including when optimisation raises.
+    """
+    with tempfile.TemporaryDirectory(prefix="prophet_stan_") as tmp:
+        directory = pathlib.Path(tmp)
+        paths = []
+        for name, mapping in (("init", inits), ("data", data)):
+            path = directory / f"{name}.json"
+            path.write_text(
+                json.dumps({k: _to_json_value(v) for k, v in mapping.items()}),
+                encoding="utf-8",
+            )
+            paths.append(str(path))
+        yield paths[0], paths[1]
 
 
 class IStanBackend(ABC):
@@ -153,23 +190,24 @@ class CmdStanPyBackend(IStanBackend):
             del kwargs['init']
 
         inits_list, data_list = self.prepare_data(stan_init, stan_data)
-        args = dict(
-            data=data_list,
-            inits=inits_list,
-            algorithm='Newton' if cast(float, data_list['T']) < 100 else 'LBFGS',
-            iter=int(1e4),
-        )
-        args.update(kwargs)
+        with stan_json_files(inits_list, data_list) as (inits_path, data_path):
+            args = dict(
+                data=data_path,
+                inits=inits_path,
+                algorithm='Newton' if cast(float, data_list['T']) < 100 else 'LBFGS',
+                iter=int(1e4),
+            )
+            args.update(kwargs)
 
-        try:
-            self.stan_fit = self.model.optimize(**args)
-        except RuntimeError as e:
-            # Fall back on Newton
-            if not self.newton_fallback or args['algorithm'] == 'Newton':
-                raise e
-            logger.warning('Optimization terminated abnormally. Falling back to Newton.')
-            args['algorithm'] = 'Newton'
-            self.stan_fit = self.model.optimize(**args)
+            try:
+                self.stan_fit = self.model.optimize(**args)
+            except RuntimeError as e:
+                # Fall back on Newton
+                if not self.newton_fallback or args['algorithm'] == 'Newton':
+                    raise e
+                logger.warning('Optimization terminated abnormally. Falling back to Newton.')
+                args['algorithm'] = 'Newton'
+                self.stan_fit = self.model.optimize(**args)
         params = self.stan_to_dict_numpy(
             self.stan_fit.column_names, self.stan_fit.optimized_params_np)
         for par in params:
@@ -188,19 +226,19 @@ class CmdStanPyBackend(IStanBackend):
             del kwargs['init']
 
         inits_list, data_list = self.prepare_data(stan_init, stan_data)
-        args = dict(
-            data=data_list,
-            inits=inits_list,
-        )
         if 'chains' not in kwargs:
             kwargs['chains'] = 4
         iter_half = samples // 2
         kwargs['iter_sampling'] = iter_half
         if 'iter_warmup' not in kwargs:
             kwargs['iter_warmup'] = iter_half
-        args.update(kwargs)
-
-        self.stan_fit = self.model.sample(**args)
+        with stan_json_files(inits_list, data_list) as (inits_path, data_path):
+            args = dict(
+                data=data_path,
+                inits=inits_path,
+            )
+            args.update(kwargs)
+            self.stan_fit = self.model.sample(**args)
         res = self.stan_fit.draws()
         (samples, c, columns) = res.shape
         res = res.reshape((samples * c, columns))
@@ -254,29 +292,36 @@ class CmdStanPyBackend(IStanBackend):
     def prepare_data(
         init: dict[str, Any],
         data: dict[str, Any],
-    ) -> tuple[dict[str, float | list[float]], dict[str, float | list[float]]]:
-        """Converts np.ndarrays to lists that can be read by cmdstanpy."""
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Selects the Stan inputs in the form cmdstanpy reads.
+
+        Arrays are deliberately left as numpy objects rather than converted to
+        nested Python lists. stanio serialises numpy values with a single
+        C-level ``tolist`` call, whereas a list is walked element by element
+        in Python, which dominated the cost of fit(). The JSON written is
+        identical because ``tolist`` yields the same Python floats.
+        """
         cmdstanpy_data = {
             'T': data['T'],
             'S': data['S'],
             'K': data['K'],
             'tau': data['tau'],
             'trend_indicator': data['trend_indicator'],
-            'y': data['y'].tolist(),
-            't': data['t'].tolist(),
-            'cap': data['cap'].tolist(),
-            't_change': data['t_change'].tolist(),
-            's_a': data['s_a'].tolist(),
-            's_m': data['s_m'].tolist(),
-            'X': data['X'].to_numpy().tolist(),
+            'y': np.asarray(data['y']),
+            't': np.asarray(data['t']),
+            'cap': np.asarray(data['cap']),
+            't_change': np.asarray(data['t_change']),
+            's_a': np.asarray(data['s_a']),
+            's_m': np.asarray(data['s_m']),
+            'X': data['X'].to_numpy(),
             'sigmas': data['sigmas']
         }
 
         cmdstanpy_init = {
             'k': init['k'],
             'm': init['m'],
-            'delta': init['delta'].tolist(),
-            'beta': init['beta'].tolist(),
+            'delta': np.asarray(init['delta']),
+            'beta': np.asarray(init['beta']),
             'sigma_obs': init['sigma_obs']
         }
         return (cmdstanpy_init, cmdstanpy_data)
@@ -330,6 +375,13 @@ class StanBackendEnum(Enum):
 
     @staticmethod
     def get_backend_class(name: str) -> type[IStanBackend]:
+        if name == "MLX":
+            # Experimental and MAP-only, so it is opt-in by name and kept out of the
+            # enum that Prophet iterates when choosing a default backend. The lazy
+            # import also avoids a circular import, as mlx_backend imports this module.
+            from prophet.mlx_backend import MLXBackend
+
+            return MLXBackend
         try:
             return StanBackendEnum[name].value
         except KeyError as e:

@@ -19,6 +19,9 @@ if TYPE_CHECKING:
     import matplotlib.pyplot as plt
 
     _Mode: TypeAlias = Literal['additive', 'multiplicative']
+    _SeasonalityFeatures: TypeAlias = tuple[
+        pd.DataFrame, list[float], pd.DataFrame, dict[_Mode, list[str]]
+    ]
 
 import numpy as np
 import numpy.typing as npt
@@ -1366,9 +1369,11 @@ class Prophet:
             df = self.setup_dataframe(df.copy())
 
         df['trend'] = self.predict_trend(df)
-        seasonal_components = self.predict_seasonal_components(df)
+        # Built once and shared: the features depend only on ds and regressors.
+        features = self.make_all_seasonality_features(df)
+        seasonal_components = self.predict_seasonal_components(df, features)
         if self.uncertainty_samples:
-            intervals = self.predict_uncertainty(df, vectorized)
+            intervals = self.predict_uncertainty(df, vectorized, features)
         else:
             intervals = None
 
@@ -1508,20 +1513,26 @@ class Prophet:
 
         return trend * cast(float, self.y_scale) + df['floor']
 
-    def predict_seasonal_components(self, df: pd.DataFrame) -> pd.DataFrame:
+    def predict_seasonal_components(
+        self,
+        df: pd.DataFrame,
+        features: _SeasonalityFeatures | None = None,
+    ) -> pd.DataFrame:
         """Predict seasonality components, holidays, and added regressors.
 
         Parameters
         ----------
         df: Prediction dataframe.
+        features: Optional result of make_all_seasonality_features(df), to
+            avoid rebuilding the same features within one predict() call.
 
         Returns
         -------
         Dataframe with seasonal components.
         """
-        seasonal_features, _, component_cols, _ = (
-            self.make_all_seasonality_features(df)
-        )
+        if features is None:
+            features = self.make_all_seasonality_features(df)
+        seasonal_features, _, component_cols, _ = features
         if self.uncertainty_samples:
             lower_p = 100 * (1.0 - self.interval_width) / 2
             upper_p = 100 * (1.0 + self.interval_width) / 2
@@ -1538,34 +1549,39 @@ class Prophet:
             data[component] = np.nanmean(comp, axis=1)
             if self.uncertainty_samples:
                 # pyrefly:ignore[unbound-name]
-                data[component + '_lower'] = self.percentile(comp, lower_p, axis=1)
-                # pyrefly:ignore[unbound-name]
-                data[component + '_upper'] = self.percentile(comp, upper_p, axis=1)
+                lower, upper = self.percentile_interval(comp, lower_p, upper_p)
+                data[component + '_lower'] = lower
+                data[component + '_upper'] = upper
         return pd.DataFrame(data)
 
-    def predict_uncertainty(self, df: pd.DataFrame, vectorized: bool) -> pd.DataFrame:
+    def predict_uncertainty(
+        self,
+        df: pd.DataFrame,
+        vectorized: bool,
+        features: _SeasonalityFeatures | None = None,
+    ) -> pd.DataFrame:
         """Prediction intervals for yhat and trend.
 
         Parameters
         ----------
         df: Prediction dataframe.
         vectorized: Whether to use a vectorized method for generating future draws.
+        features: Optional precomputed make_all_seasonality_features(df).
 
         Returns
         -------
         Dataframe with uncertainty intervals.
         """
-        sim_values = self.sample_posterior_predictive(df, vectorized)
+        sim_values = self.sample_posterior_predictive(df, vectorized, features)
 
         lower_p = 100 * (1.0 - self.interval_width) / 2
         upper_p = 100 * (1.0 + self.interval_width) / 2
 
         series = {}
         for key in ['yhat', 'trend']:
-            series['{}_lower'.format(key)] = self.percentile(
-                sim_values[key], lower_p, axis=1)
-            series['{}_upper'.format(key)] = self.percentile(
-                sim_values[key], upper_p, axis=1)
+            lower, upper = self.percentile_interval(sim_values[key], lower_p, upper_p)
+            series['{}_lower'.format(key)] = lower
+            series['{}_upper'.format(key)] = upper
 
         return pd.DataFrame(series)
 
@@ -1573,6 +1589,7 @@ class Prophet:
         self,
         df: pd.DataFrame,
         vectorized: bool,
+        features: _SeasonalityFeatures | None = None,
     ) -> dict[str, npt.NDArray[np.float64]]:
         """Prophet posterior predictive samples.
 
@@ -1580,6 +1597,7 @@ class Prophet:
         ----------
         df: Prediction dataframe.
         vectorized: Whether to use a vectorized method to generate future draws.
+        features: Optional precomputed make_all_seasonality_features(df).
 
         Returns
         -------
@@ -1591,13 +1609,19 @@ class Prophet:
             self.uncertainty_samples / float(n_iterations)
         )))
         # Generate seasonality features once so we can re-use them.
-        seasonal_features, _, component_cols, _ = (
-            self.make_all_seasonality_features(df)
-        )
-        sim_values = {'yhat': [], 'trend': []}
+        if features is None:
+            features = self.make_all_seasonality_features(df)
+        seasonal_features, _, component_cols, _ = features
+        n_rows = len(df)
+        # Fill preallocated (n_rows, n_total) arrays block by block so no
+        # per-sample dicts are built and no column_stack copy is needed.
+        n_total = n_iterations * samp_per_iter
+        yhat = np.empty((n_rows, n_total))
+        trend = np.empty((n_rows, n_total))
         for i in range(n_iterations):
+            block = slice(i * samp_per_iter, (i + 1) * samp_per_iter)
             if vectorized:
-                sims = self.sample_model_vectorized(
+                yhat_i, trend_i = self._sample_model_arrays(
                     df=df,
                     seasonal_features=seasonal_features,
                     iteration=i,
@@ -1605,21 +1629,21 @@ class Prophet:
                     s_m=component_cols['multiplicative_terms'],
                     n_samples=samp_per_iter
                 )
+                yhat[:, block] = yhat_i.T
+                trend[:, block] = trend_i.T
             else:
-                sims = [
-                    self.sample_model(
+                for j in range(i * samp_per_iter, (i + 1) * samp_per_iter):
+                    sim = self.sample_model(
                         df=df,
                         seasonal_features=seasonal_features,
                         iteration=i,
                         s_a=component_cols['additive_terms'],
                         s_m=component_cols['multiplicative_terms'],
-                    ) for _ in range(samp_per_iter)
-                ]
-            for key in sim_values:
-                for sim in sims:
-                    sim_values[key].append(sim[key])
+                    )
+                    yhat[:, j] = sim['yhat']
+                    trend[:, j] = sim['trend']
 
-        return {k: np.column_stack(v) for k, v in sim_values.items()}
+        return {"yhat": yhat, "trend": trend}
 
     def sample_model(
         self,
@@ -1683,6 +1707,31 @@ class Prophet:
         -------
         List (length n_samples) of dictionaries with arrays for trend and yhat, each ordered like df['t'].
         """
+        yhat, trend = self._sample_model_arrays(
+            df=df,
+            seasonal_features=seasonal_features,
+            iteration=iteration,
+            s_a=s_a,
+            s_m=s_m,
+            n_samples=n_samples,
+        )
+        return [{"yhat": y, "trend": t} for y, t in zip(yhat, trend)]
+
+    def _sample_model_arrays(
+        self,
+        df: pd.DataFrame,
+        seasonal_features: pd.DataFrame,
+        iteration: int,
+        s_a: pd.Series,
+        s_m: pd.Series,
+        n_samples: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Array form of sample_model_vectorized().
+
+        Returns
+        -------
+        Tuple (yhat, trend), each with shape (n_samples, len(df)).
+        """
         # Get the seasonality and regressor components, which are deterministic per iteration
         beta = self.params['beta'][iteration]
         Xb_a = np.matmul(seasonal_features.values,
@@ -1691,15 +1740,14 @@ class Prophet:
         # Get the future trend, which is stochastic per iteration
         trends = self.sample_predictive_trend_vectorized(df, n_samples, iteration)  # already on the same scale as the actual data
         sigma = self.params['sigma_obs'][iteration]
-        noise_terms = np.random.normal(0, sigma, trends.shape) * cast(float, self.y_scale)
-
-        simulations = []
-        for trend, noise in zip(trends, noise_terms):
-            simulations.append({
-                'yhat': trend * (1 + Xb_m) + Xb_a + noise,
-                'trend': trend
-            })
-        return simulations
+        noise_terms = np.random.normal(0, sigma, trends.shape)
+        noise_terms *= cast(float, self.y_scale)
+        # In-place accumulation keeps the same operation order (so identical
+        # floats) while avoiding two (n_samples, n_rows) temporaries.
+        yhat = trends * (1 + Xb_m)
+        yhat += Xb_a
+        yhat += noise_terms
+        return yhat, trends
 
     def sample_predictive_trend(self, df: pd.DataFrame, iteration: int) -> np.ndarray:
         """Simulate the trend using the extrapolated generative model.
@@ -1991,6 +2039,17 @@ class Prophet:
         df = self.setup_dataframe(df.copy())
         return self.sample_posterior_predictive(df, vectorized)
 
+    def percentile_interval(
+        self, a: npt.ArrayLike, lower_p: float, upper_p: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Lower and upper percentiles along axis 1 from a single pass.
+
+        One partition of the array serves both bounds, which is about twice
+        as fast as two separate percentile calls and returns identical values.
+        """
+        lower, upper = self.percentile(a, [lower_p, upper_p], axis=1)
+        return lower, upper
+
     def percentile(self, a: npt.ArrayLike, *args: Any, **kwargs: Any) -> np.ndarray:
         """
         We rely on np.nanpercentile in the rare instances where there
@@ -2050,6 +2109,7 @@ class Prophet:
         ylabel: str = 'y',
         figsize: tuple[int, int] = (10, 6),
         include_legend: bool = False,
+        **style: Any,
     ) -> plt.Figure:
         """Plot the Prophet forecast.
 
@@ -2064,6 +2124,8 @@ class Prophet:
         ylabel: Optional label name on Y-axis
         figsize: Optional tuple width, height in inches.
         include_legend: Optional boolean to add legend to the plot.
+        **style: Keyword-only styling options of prophet.plot.plot, such as
+            title, subtitle, annotate and source.
 
         Returns
         -------
@@ -2072,7 +2134,7 @@ class Prophet:
         return plot(
             m=self, fcst=fcst, ax=ax, uncertainty=uncertainty,
             plot_cap=plot_cap, xlabel=xlabel, ylabel=ylabel,
-            figsize=figsize, include_legend=include_legend
+            figsize=figsize, include_legend=include_legend, **style
         )
 
     def plot_components(
@@ -2083,6 +2145,7 @@ class Prophet:
         weekly_start: int = 0,
         yearly_start: int = 0,
         figsize: tuple[int, int] | None = None,
+        **style: Any,
     ) -> plt.Figure:
         """Plot the Prophet forecast components.
 
@@ -2102,6 +2165,8 @@ class Prophet:
             seasonality plot. 0 (default) starts the year on Jan 1. 1 shifts
             by 1 day to Jan 2, and so on.
         figsize: Optional tuple width, height in inches.
+        **style: Keyword-only styling options of prophet.plot.plot_components,
+            such as title, annotate, panel_titles and source.
 
         Returns
         -------
@@ -2110,6 +2175,6 @@ class Prophet:
         return plot_components(
             m=self, fcst=fcst, uncertainty=uncertainty, plot_cap=plot_cap,
             weekly_start=weekly_start, yearly_start=yearly_start,
-            figsize=figsize
+            figsize=figsize, **style
         )
  
