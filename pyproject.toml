@@ -1,9 +1,9 @@
 [project]
-name = "neoprophet"
+name = "neoprophet-workspace"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
-    "prophet[mlx]",
+    "neoprophet[mlx]",
 ]
 
 [tool.uv.workspace]
@@ -12,7 +12,7 @@ members = [
 ]
 
 [tool.uv.sources]
-prophet = { workspace = true, editable = true }
+neoprophet = { workspace = true, editable = true }
 
 [dependency-groups]
 dev = [

@@ -7,6 +7,7 @@ Additive time series forecasting library (trend + seasonality + holidays) backed
 - Python >=3.10 (forecaster library), Go 1.25+ (wrapper service), R (CRAN package)
 - Stan via cmdstanpy >=1.0.4 — shared compiled binary used by both Python and Go
 - Python build: setuptools + wheel; Go build: `go build`
+- Published to PyPI as `neoprophet` (import name stays `prophet`) by `.github/workflows/wheel.yml` when a GitHub release is published (Trusted Publishing, environment `release`); the version lives in `python/prophet/__version__.py`
 - Python deps: numpy, pandas, matplotlib, holidays, tqdm
 - Type checker: pyrefly 0.50.0; Tests: pytest (Python), `go test` (Go)
 - CI: GitHub Actions (`build-and-test.yml`, `wheel.yml`)

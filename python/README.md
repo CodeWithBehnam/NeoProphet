@@ -1,43 +1,42 @@
-# Prophet: Automatic Forecasting Procedure
+# NeoProphet
 
-Prophet is a procedure for forecasting time series data based on an additive model where non-linear trends are fit with yearly, weekly, and daily seasonality, plus holiday effects. It works best with time series that have strong seasonal effects and several seasons of historical data. Prophet is robust to missing data and shifts in the trend, and typically handles outliers well.
+**Prophet forecasting that is easier to use, clearer to read and faster at scale.**
 
-Prophet is [open source software](https://code.facebook.com/projects/>)  released by [Facebook's Core Data Science team ](https://research.fb.com/category/data-science/).
+NeoProphet is a drop-in fork of [Facebook Prophet](https://github.com/facebook/prophet) with a one-call API, self-explaining charts, built-in tuning and an experimental Apple Silicon GPU backend for fitting many series at once.
 
-Full documentation and examples available at the homepage: https://facebook.github.io/prophet/
+![A NeoProphet forecast with history and forecast zones, changepoint callouts and a plain-English title](https://raw.githubusercontent.com/CodeWithBehnam/NeoProphet/main/.github/assets/forecast.png)
 
-## Important links
+## Install
 
-- HTML documentation: https://facebook.github.io/prophet/docs/quick_start.html
-- Issue tracker: https://github.com/facebook/prophet/issues
-- Source code repository: https://github.com/facebook/prophet
-- Implementation of Prophet in R: https://cran.r-project.org/package=prophet
+```bash
+pip install neoprophet            # or: uv add neoprophet
+pip install "neoprophet[mlx]"     # adds the MLX backend on Apple Silicon
+```
 
-## Other forecasting packages
+NeoProphet installs the `prophet` import package, so it replaces upstream Prophet: uninstall `prophet` first and do not install both in one environment. Wheels include the compiled Stan model for macOS (Intel and Apple Silicon), Linux (x86-64 and ARM64) and Windows.
 
-- Rob Hyndman's [forecast package](http://robjhyndman.com/software/forecast/)
-- [Statsmodels](http://statsmodels.sourceforge.net/)
-
-## Installation - PyPI release
-
-See [Installation in Python - PyPI release](https://github.com/facebook/prophet#installation-in-python---pypi-release)
-
-## Installation - Development version
-
-See [Installation in Python - Development version](https://github.com/facebook/prophet#installation-in-python---development-version)
-
-### Installation using Docker and docker-compose (via Makefile)
-
-Simply type `make build` and if everything is fine you should be able to `make shell` or alternative jump directly to `make py-shell`.
-
-To run the tests, inside the container `cd python/prophet` and then `python -m pytest prophet/tests/`
-
-### Example usage
+## Quick start
 
 ```python
-  >>> from prophet import Prophet
-  >>> m = Prophet()
-  >>> m.fit(df)  # df is a pandas.DataFrame with 'y' and 'ds' columns
-  >>> future = m.make_future_dataframe(periods=365)
-  >>> m.predict(future)
+import pandas as pd
+from prophet import forecast
+
+df = pd.read_csv("https://raw.githubusercontent.com/CodeWithBehnam/NeoProphet/main/examples/example_wp_log_peyton_manning.csv")
+result = forecast(df, horizon="12 months", country_holidays="US")
+result.forecast            # ds, yhat, yhat_lower, yhat_upper for the future
+result.plot()              # the chart above
+result.plot_components()   # trend, holidays, weekly and yearly patterns
 ```
+
+- `forecast(..., tune=True)` chooses the prior scales and seasonality mode by parallel cross-validation.
+- `prophet.mlx_backend.fit_many(dfs)` fits many series in one batch on an Apple Silicon GPU (experimental; linear and flat growth, MAP only).
+- The classic API is unchanged: `from prophet import Prophet` works as before.
+
+## Links
+
+- Source, benchmarks and notebooks: https://github.com/CodeWithBehnam/NeoProphet
+- Issues: https://github.com/CodeWithBehnam/NeoProphet/issues
+- Upstream Prophet documentation: https://facebook.github.io/prophet/
+- Paper: Taylor and Letham (2018), *Forecasting at Scale*, The American Statistician 72(1):37-45.
+
+Released under the MIT licence. Prophet was created by Sean J. Taylor and Ben Letham at Facebook.

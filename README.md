@@ -6,6 +6,7 @@
 
 A drop-in fork of [Facebook Prophet](https://github.com/facebook/prophet) with a one-call API, self-explaining charts, built-in tuning, an experimental Apple Silicon GPU backend and a Go service for high-throughput serving.
 
+[![PyPI](https://img.shields.io/pypi/v/neoprophet?color=990F3D)](https://pypi.org/project/neoprophet/)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-990F3D)
 ![Licence MIT](https://img.shields.io/badge/licence-MIT-5C534C)
 ![Apple Silicon MLX](https://img.shields.io/badge/Apple%20Silicon-MLX%20backend-8C8178)
@@ -42,16 +43,17 @@ Existing code keeps working: `from prophet import Prophet` is unchanged, and the
 
 ## Install
 
-NeoProphet installs as the `prophet` package, so it replaces upstream Prophet in that environment. The Stan model is compiled on install, which takes a few minutes and needs a C++ toolchain (Xcode Command Line Tools on macOS).
-
 ```bash
-uv add "prophet @ git+https://github.com/CodeWithBehnam/NeoProphet#subdirectory=python"
+pip install neoprophet            # or: uv add neoprophet
+pip install "neoprophet[mlx]"     # adds the MLX backend on Apple Silicon
 ```
 
-On Apple Silicon, add the MLX extra for the GPU backend:
+NeoProphet installs the `prophet` import package, so it replaces upstream Prophet: uninstall `prophet` first and do not install both in one environment. Wheels include the compiled Stan model for macOS (Intel and Apple Silicon), Linux (x86-64 and ARM64) and Windows.
+
+To track `main`, install from GitHub instead. This compiles the Stan model, which takes a few minutes and needs a C++ toolchain (Xcode Command Line Tools on macOS):
 
 ```bash
-uv add "prophet[mlx] @ git+https://github.com/CodeWithBehnam/NeoProphet#subdirectory=python"
+uv add "neoprophet @ git+https://github.com/CodeWithBehnam/NeoProphet#subdirectory=python"
 ```
 
 ## Feature tour

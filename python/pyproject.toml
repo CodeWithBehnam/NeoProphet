@@ -7,10 +7,11 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "prophet"
+name = "neoprophet"
 dynamic = ["version"]
-description = "Automatic Forecasting Procedure"
+description = "Prophet forecasting that is easier to use, clearer to read and faster at scale"
 readme = "README.md"
+keywords = ["forecasting", "time series", "prophet", "stan", "mlx"]
 requires-python = ">=3.10"
 dependencies = [
   "cmdstanpy>=1.0.4",
@@ -25,7 +26,7 @@ authors = [
   {name = "Ben Letham", email = "bletham@fb.com"},
 ]
 maintainers = [
-  {name = "Cuong Duong", email = "cuong.duong242@gmail.com"},
+  {name = "Behnam"},
 ]
 license = {text = "MIT"}
 classifiers = [
@@ -60,9 +61,10 @@ parallel = [
 ]
 
 [project.urls]
-Homepage = "https://facebook.github.io/prophet/"
-Documentation = "https://facebook.github.io/prophet/"
-Repository = "https://github.com/facebook/prophet"
+Homepage = "https://github.com/CodeWithBehnam/NeoProphet"
+Repository = "https://github.com/CodeWithBehnam/NeoProphet"
+Issues = "https://github.com/CodeWithBehnam/NeoProphet/issues"
+"Upstream documentation" = "https://facebook.github.io/prophet/"
 
 
 [tool.pyrefly]
