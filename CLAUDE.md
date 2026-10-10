@@ -27,6 +27,8 @@ python/
     quick.py            # forecast(): one-call API, input normalisation, frequency inference
     tuning.py           # tune(): parallel cross-validated hyperparameter search
     mlx_backend.py      # Experimental MLX backend (MAP only) and batched fit_many()
+    weather.py          # Open-Meteo temperature (archive, forecast, climatology) with disk cache; tests never hit the network
+    visuals.py          # Backtest, regressor effects, one-page report, offline HTML dashboard
     tests/              # pytest suite
   stan/
     prophet.stan        # The Stan model (logistic + linear trend)

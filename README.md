@@ -35,6 +35,9 @@ Upstream Prophet is a great model with a dated developer experience. NeoProphet 
 | **Frequency** | you pass `freq` yourself | detected automatically, including irregular series |
 | **Charts** | plain axes and a legend | data-derived titles, history and forecast zones, changepoint callouts, plain-English cross-validation labels |
 | **Tuning** | write your own grid search | `forecast(..., tune=True)` or `prophet.tune(df)`, parallel cross-validation |
+| **Regressors** | `add_regressor` plus building future frames by hand | `regressors=["promo"]`, validated future values, `weather="London"` for local temperature |
+| **Closed days** | filter the future frame yourself; charts show empty gaps | `skip_days="weekends"`, `skip_hours=...`, gap-free charts |
+| **Outputs** | forecast and components charts | plus backtest, regressor effects, one-page PDF report and offline HTML dashboard |
 | **Many series** | fit them one by one | `fit_many()` fits 100 series in 1.3 s on an Apple Silicon GPU (experimental) |
 | **Serving** | not included | Go REST service sharing the same Stan model |
 | **Accuracy** | baseline | identical to upstream with default settings |
@@ -84,6 +87,33 @@ result.tuning.scores        # every combination with its cross-validation metric
 ```
 
 Tuning searches 33 combinations in parallel and took 6 to 21 seconds per example dataset (about 2 minutes for 18,000 five-minute rows). Cross-validation only sees the past, so treat the result as a starting point: on the 8 example datasets it beat untuned Prophet defaults on 4 and was worse on 2, and hand-chosen settings still won on most. Check `result.tuning.scores` and a holdout before trusting it.
+
+### Regressors, local temperature and skipped days
+
+```python
+result = forecast(
+    sales,
+    horizon="60D",
+    regressors=["promo", "price"],     # columns in your data; future values via future=
+    weather="Manchester",              # or (53.48, -2.24): daily temperature as a regressor
+    skip_days="weekends",              # closed on Saturdays and Sundays
+)
+```
+
+- `regressors=` takes column names, a dict of Series or a DataFrame, with `regressor_options=` for mode and prior scale. Missing future values fail with the exact timestamps that are missing.
+- `weather=` fetches temperature for any place name or coordinates from [Open-Meteo](https://open-meteo.com) (free, no API key, cached on disk): recorded values for the history, the weather forecast for the next 16 days and, beyond that, the average for that day of year from the previous 5 years. Charts label which future values came from the forecast and which from climatology. Open-Meteo's free API is for non-commercial use; see its [terms](https://open-meteo.com/en/terms).
+- `skip_days=` (`"weekends"`, `"Sat"`, `5`, ...) and, for sub-daily data, `skip_hours=` remove those periods from training, the forecast and every chart, so Friday joins Monday with no empty gap.
+
+### Backtests, reports and dashboards
+
+```python
+result.plot_backtest()          # forecast against what actually happened on a held-out period
+result.plot_regressor_effects() # how much each regressor moves the forecast, in plain words
+result.report().savefig("forecast-report.pdf")   # one page: forecast, components, effects, accuracy
+result.dashboard("forecast.html")                # interactive, self-contained, works offline
+```
+
+The same functions are available for any fitted model in `prophet.visuals`.
 
 ### Many series on an Apple Silicon GPU (experimental)
 
@@ -195,7 +225,9 @@ python/
   prophet/
     quick.py            # forecast(): one-call API, input normalisation, frequency inference
     tuning.py           # tune(): parallel cross-validated hyperparameter search
-    plot.py             # Default chart style (matplotlib and plotly)
+    plot.py             # Default chart style (matplotlib and plotly), gap-free skip_axis()
+    visuals.py          # Backtest, regressor effects, one-page report, HTML dashboard
+    weather.py          # Open-Meteo temperature: archive, forecast, climatology
     forecaster.py       # Core Prophet class: fit(), predict()
     models.py           # CmdStanPy backend (shells out to the Stan binary)
     mlx_backend.py      # Experimental MLX backend and batched fit_many()
