@@ -494,23 +494,39 @@ class _Task:
     seed: int
 
 
+def _keep_cmdstan_record(record: logging.LogRecord) -> bool:
+    """Keep only CRITICAL cmdstanpy records while tuning.
+
+    Every fit logs INFO lines, and L-BFGS fails as expected at extreme grid
+    points (cmdstanpy reports exit code 1 as "Operation not permitted").
+    Prophet then refits with Newton; if Newton fails too it raises, which
+    the tuner reports as a TuningError, so dropping these records loses
+    nothing a user needs.
+    """
+    return record.levelno >= logging.CRITICAL
+
+
+def _keep_models_record(record: logging.LogRecord) -> bool:
+    """Drop Prophet's Newton fallback warning while tuning, for the reason above."""
+    return "Falling back to Newton" not in record.getMessage()
+
+
 @contextlib.contextmanager
 def _quiet_cmdstan() -> Iterator[None]:
-    """Silence per-fit INFO lines, which would otherwise be thousands.
+    """Silence per-fit log lines and expected optimiser fallbacks while tuning.
 
-    A logger filter is used because cmdstanpy resets the logger level on
+    Logger filters are used because cmdstanpy resets the logger level on
     every fit, so ``setLevel`` does not stick.
     """
-
-    def drop_info(record: logging.LogRecord) -> bool:
-        return record.levelno > logging.INFO
-
-    log = logging.getLogger("cmdstanpy")
-    log.addFilter(drop_info)
+    cmdstan = logging.getLogger("cmdstanpy")
+    models = logging.getLogger("prophet.models")
+    cmdstan.addFilter(_keep_cmdstan_record)
+    models.addFilter(_keep_models_record)
     try:
         yield
     finally:
-        log.removeFilter(drop_info)
+        cmdstan.removeFilter(_keep_cmdstan_record)
+        models.removeFilter(_keep_models_record)
 
 
 def _overall_metrics(cv: pd.DataFrame) -> dict[str, float]:

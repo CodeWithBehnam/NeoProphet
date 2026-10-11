@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 import math
 
 import pandas as pd
@@ -323,3 +324,49 @@ def test_tune_coverage_metric_keeps_intervals(daily_univariate_ts):
 def test_module_exposes_expected_api():
     for name in ("tune", "TuningResult", "derive_windows", "default_param_grid"):
         assert hasattr(tuning, name)
+
+
+def _record(name: str, level: int, msg: str) -> logging.LogRecord:
+    return logging.LogRecord(name, level, __file__, 0, msg, None, None)
+
+
+def test_quiet_filters_drop_expected_fallback_noise_only() -> None:
+    from prophet.tuning import _keep_cmdstan_record, _keep_models_record
+
+    assert not _keep_cmdstan_record(
+        _record("cmdstanpy", logging.INFO, "Chain [1] start processing")
+    )
+    assert not _keep_cmdstan_record(
+        _record(
+            "cmdstanpy",
+            logging.ERROR,
+            "Chain [1] error: code '1' Operation not permitted",
+        )
+    )
+    assert _keep_cmdstan_record(
+        _record("cmdstanpy", logging.CRITICAL, "binary missing")
+    )
+    assert not _keep_models_record(
+        _record(
+            "prophet.models",
+            logging.WARNING,
+            "Optimization terminated abnormally. Falling back to Newton.",
+        )
+    )
+    assert _keep_models_record(
+        _record("prophet.models", logging.WARNING, "something else")
+    )
+
+
+def test_quiet_cmdstan_removes_its_filters() -> None:
+    from prophet.tuning import _quiet_cmdstan
+
+    cmdstan, models = (
+        logging.getLogger("cmdstanpy"),
+        logging.getLogger("prophet.models"),
+    )
+    before = (list(cmdstan.filters), list(models.filters))
+    with _quiet_cmdstan():
+        assert len(cmdstan.filters) == len(before[0]) + 1
+        assert len(models.filters) == len(before[1]) + 1
+    assert (cmdstan.filters, models.filters) == before
