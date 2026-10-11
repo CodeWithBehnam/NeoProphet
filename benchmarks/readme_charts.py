@@ -3,7 +3,7 @@
 The forecast and components charts come straight from the library's default
 plot style, so they change whenever ``prophet/plot.py`` does. The throughput
 chart reads the JSON written by ``compare_upstream.py`` (run it through
-``notebooks/benchmark_vs_upstream.ipynb``), so no numbers are typed in by hand.
+``notebooks/09_benchmark_vs_upstream.ipynb``), so no numbers are typed in by hand.
 
 Usage::
 
@@ -181,7 +181,7 @@ def throughput_figure(t: Throughput) -> Figure:
     fig.text(
         0.04,
         0.03,
-        "Source: benchmarks/compare_upstream.py via notebooks/benchmark_vs_upstream.ipynb",
+        "Source: benchmarks/compare_upstream.py via notebooks/09_benchmark_vs_upstream.ipynb",
         color=INK_SOFT,
         fontsize=8.5,
         family=installed(SANS_STACK),

@@ -174,7 +174,7 @@ curl -X POST http://localhost:8080/v1/predict \
 
 ## Benchmarks against upstream Prophet
 
-[`notebooks/benchmark_vs_upstream.ipynb`](notebooks/benchmark_vs_upstream.ipynb) runs NeoProphet and upstream Prophet 1.5.0 (from PyPI, in an isolated environment) through the same runner on the 8 example datasets, scoring each on a held-out final period. Apple M2 Max, median of 3 runs:
+[`notebooks/09_benchmark_vs_upstream.ipynb`](notebooks/09_benchmark_vs_upstream.ipynb) runs NeoProphet and upstream Prophet 1.5.0 (from PyPI, in an isolated environment) through the same runner on the 8 example datasets, scoring each on a held-out final period. Apple M2 Max, median of 3 runs:
 
 | Variant | Holdout accuracy against upstream | Fit and predict speed against upstream |
 |---|---|---|
@@ -187,12 +187,20 @@ Regenerate the README charts from a benchmark run with `uv run python benchmarks
 
 ## Notebooks
 
-| Notebook | Description |
-|----------|-------------|
-| [`starter.ipynb`](notebooks/starter.ipynb) | Start here: one-call forecast, the full API, components and cross-validation |
-| [`benchmark_vs_upstream.ipynb`](notebooks/benchmark_vs_upstream.ipynb) | NeoProphet against upstream Prophet: accuracy, speed, tuning and MLX throughput |
-| [`benchmark_python_vs_go.ipynb`](notebooks/benchmark_python_vs_go.ipynb) | Python against the Go service on Peyton Manning, with forecast and component plots |
-| [`benchmark_all_datasets.ipynb`](notebooks/benchmark_all_datasets.ipynb) | All 8 example datasets with per-dataset hyperparameters and a forecasts gallery |
+A ten-part series that builds from a first forecast to production use. Every notebook uses the bundled example data, runs end to end in a few minutes and links to the next.
+
+| # | Notebook | What you learn |
+|---|----------|----------------|
+| 00 | [Quick start](notebooks/00_quick_start.ipynb) | A forecast, its components and a report in one call |
+| 01 | [Your data](notebooks/01_your_data.ipynb) | Input shapes, bad-data errors, frequencies and horizons, timezones, skipped days and hours |
+| 02 | [Trend](notebooks/02_trend.ipynb) | Changepoints, saturating (logistic) growth, flat trends and one-off shocks |
+| 03 | [Seasonality and holidays](notebooks/03_seasonality_and_holidays.ipynb) | Fourier order, custom and conditional seasonality, country and custom holidays, multiplicative mode |
+| 04 | [Regressors and weather](notebooks/04_regressors_and_weather.ipynb) | Extra regressors, future values, local temperature with `weather=` |
+| 05 | [Uncertainty and outliers](notebooks/05_uncertainty_and_outliers.ipynb) | Where intervals come from, checking coverage, handling outliers |
+| 06 | [Evaluation and tuning](notebooks/06_evaluation_and_tuning.ipynb) | Backtests, cross-validation, metrics, and when tuning helps |
+| 07 | [Reports and dashboards](notebooks/07_reports_and_dashboards.ipynb) | PDF reports, offline dashboards, saving, reloading and warm-starting models |
+| 08 | [Many series on Apple Silicon](notebooks/08_many_series_mlx.ipynb) | Fitting many series at once with the MLX backend |
+| 09 | [Benchmark against upstream](notebooks/09_benchmark_vs_upstream.ipynb) | NeoProphet against upstream Prophet on accuracy, speed, tuning and throughput |
 
 ## Development
 
@@ -246,7 +254,7 @@ go/
     pool/               # Bounded-concurrency worker pool
   api/http/             # REST: /v1/fit, /v1/predict, /v1/cv, /v1/health
 benchmarks/             # Upstream comparison runner, README chart generator, Python vs Go scripts
-notebooks/              # Starter and benchmark notebooks
+notebooks/              # Tutorial series 00 to 09 and helpers.py
 examples/               # Example datasets (CSV)
 R/                      # R package (CRAN-published upstream)
 ```

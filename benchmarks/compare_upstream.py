@@ -84,8 +84,8 @@ class DatasetSpec:
     prophet_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
-# Settings mirror notebooks/benchmark_all_datasets.ipynb so configs stay
-# consistent across the repo. Horizons: 365 days for the long daily series,
+# Settings follow the per-dataset configurations used throughout the
+# notebooks so results stay comparable across the repo. Horizons: 365 days for the long daily series,
 # 90 days for the shorter pedestrian series, 24 months for monthly series and
 # 576 five-minute steps (two days) for Yosemite.
 DATASETS: tuple[DatasetSpec, ...] = (
