@@ -79,11 +79,12 @@ _SUPPORTED_FIT_KWARGS = ("init", "device", "max_iter", "tol", "chunk_elements")
 
 def _require_mlx() -> Any:
     try:
-        import mlx.core as mx
+        # mlx is an optional extra, so CI type checks run without it installed.
+        import mlx.core as mx  # pyrefly: ignore[missing-import]
     except ImportError as e:
         raise ImportError(
             "The MLX backend needs the 'mlx' package (Apple Silicon only). "
-            "Install it with: pip install 'prophet[mlx]'"
+            "Install it with: pip install 'neoprophet[mlx]'"
         ) from e
     return mx
 

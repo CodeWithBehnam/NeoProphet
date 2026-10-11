@@ -434,6 +434,7 @@ def test_sub_daily_components_blank_the_skipped_hours() -> None:
 
 
 def test_plotly_closes_gaps_with_range_breaks(weekend_result: Any) -> None:
+    pytest.importorskip("plotly.graph_objs")
     fig = plot_plotly(
         weekend_result.model, weekend_result.predictions, skip_days="weekends"
     )
