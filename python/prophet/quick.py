@@ -1174,7 +1174,8 @@ class ForecastResult:
     horizon_periods: Number of future periods predicted.
     include_history: Whether :attr:`forecast` also contains in-sample rows.
     tuning: The :class:`prophet.tuning.TuningResult` when ``forecast`` was
-        called with ``tune=True``, otherwise ``None``.
+        called with a truthy ``tune`` (``True``, ``"grid"`` or ``"optuna"``),
+        otherwise ``None``.
     skip_days: Weekdays left out (Monday is 0), sorted; empty when none.
     skip_hours: Hours of the day left out, sorted; empty when none.
     rows_skipped: Input rows dropped because they fell on a skipped day or hour.
@@ -1498,28 +1499,35 @@ def _resolve_prophet_params(
     history: pd.DataFrame,
     user_params: Mapping[str, Any],
     *,
-    tune: bool = False,
+    tune: bool | Literal["grid", "optuna"] = False,
     country_holidays: str | None = None,
     regressors: Sequence[str] = (),
 ) -> tuple[dict[str, Any], TuningResult | None]:
     """Choose the keyword arguments for ``Prophet(...)``.
 
-    With ``tune=True`` the default grid is searched by cross-validation, minus
-    any parameter the user set explicitly, so explicit arguments always win.
-    ``history`` must then hold a column for each of ``regressors``.
+    With ``tune=True`` (or ``"grid"``) the default grid is searched by
+    cross-validation, and with ``tune="optuna"`` the default Optuna search
+    space, minus any parameter the user set explicitly, so explicit arguments
+    always win. ``history`` must then hold a column for each of ``regressors``.
     """
     if not tune:
         return dict(user_params), None
+    if tune not in (True, "grid", "optuna"):
+        raise ValueError(f"tune must be True, False, 'grid' or 'optuna', got {tune!r}.")
+    search: Literal["grid", "optuna"] = "optuna" if tune == "optuna" else "grid"
 
     # Imported lazily: tuning pulls in process pools and cross-validation,
     # which plain forecasts never need.
     from prophet.make_holidays import make_holidays_df
-    from prophet.tuning import default_param_grid
+    from prophet.tuning import default_param_grid, default_search_space
     from prophet.tuning import tune as run_tune
 
-    grid = {k: v for k, v in default_param_grid().items() if k not in user_params}
+    defaults = default_search_space() if search == "optuna" else default_param_grid()
+    grid = {k: v for k, v in defaults.items() if k not in user_params}
     if not grid:
-        logger.warning("tune=True ignored: every tuned parameter was set explicitly.")
+        logger.warning(
+            "tune=%r ignored: every tuned parameter was set explicitly.", tune
+        )
         return dict(user_params), None
 
     # The final model adds country holidays after construction, so the tuner
@@ -1532,9 +1540,13 @@ def _resolve_prophet_params(
         )
     tune_extra: dict[str, Any] = {"regressors": tuple(regressors)} if regressors else {}
     result = run_tune(
-        history, param_grid=grid, prophet_kwargs=tuning_kwargs, **tune_extra
+        history,
+        param_grid=grid,
+        prophet_kwargs=tuning_kwargs,
+        search=search,
+        **tune_extra,
     )
-    logger.info("tune=True selected %s", result.best_params)
+    logger.info("tune=%r selected %s", tune, result.best_params)
     return {**result.best_params, **user_params}, result
 
 
@@ -1583,7 +1595,7 @@ def forecast(
     country_holidays: str | None = None,
     interval_width: float | None = None,
     tz: TimezoneMode = "wall",
-    tune: bool = False,
+    tune: bool | Literal["grid", "optuna"] = False,
     regressors: Sequence[str] | Mapping[str, pd.Series] | pd.DataFrame | None = None,
     regressor_options: Mapping[str, Mapping[str, Any]] | None = None,
     future: pd.DataFrame | None = None,
@@ -1619,6 +1631,9 @@ def forecast(
         when the latest data behaves unlike earlier data; check
         ``result.tuning.scores`` and a holdout. In scripts, call it under
         ``if __name__ == "__main__":`` because tuning uses a process pool.
+        ``tune=True`` (or ``"grid"``) scores the default grid;
+        ``tune="optuna"`` samples continuous prior scale ranges with Optuna
+        instead (40 trials, needs ``pip install 'neoprophet[optuna]'``).
         Tuning uses each regressor's default settings, so ``regressor_options``
         only apply to the final model.
     regressors: Extra explanatory variables.  Either a list of column names

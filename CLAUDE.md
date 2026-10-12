@@ -25,7 +25,8 @@ python/
     make_holidays.py    # Holiday calendar generation
     utilities.py        # Regressor and warm-start helpers
     quick.py            # forecast(): one-call API, input normalisation, frequency inference
-    tuning.py           # tune(): parallel cross-validated hyperparameter search
+    tuning.py           # tune(): parallel cross-validated hyperparameter search (grid, or search="optuna")
+    tuning_optuna.py    # Optuna glue for tune(search="optuna"), lazily imported; extra neoprophet[optuna]
     mlx_backend.py      # Experimental MLX backend (MAP only) and batched fit_many()
     weather.py          # Open-Meteo temperature (archive, forecast, climatology) with disk cache; tests never hit the network
     visuals.py          # Backtest, regressor effects, one-page report, offline HTML dashboard

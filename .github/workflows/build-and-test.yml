@@ -46,7 +46,7 @@ jobs:
     - name: Install and test
       run: |
         cd python
-        python -m pip install -U --editable ".[dev,parallel]"
+        python -m pip install -U --editable ".[dev,parallel,optuna]"
         python -m pytest prophet/tests/
 
   typecheck-python:
@@ -59,7 +59,7 @@ jobs:
           activate-environment: true
 
       - name: Install
-        run: cd python && uv pip install ".[dev,parallel]"
+        run: cd python && uv pip install ".[dev,parallel,optuna]"
 
       - name: Typecheck with pyrefly
         run: cd python && pyrefly check --output-format=github

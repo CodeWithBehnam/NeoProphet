@@ -576,6 +576,27 @@ print(best_params)
 
 Alternatively, parallelization could be done across parameter combinations by parallelizing the loop above.
 
+NeoProphet ships this search as `prophet.tuning.tune`. It scores every combination of a parameter grid on the same rolling-origin cross-validation windows, in parallel across combinations, and ranks them. It also scores Prophet's own default values (`include_defaults=False` turns that off), so `best_params` can be the defaults when no grid point beats them. With `search="optuna"` it samples ranges (`FloatRange`, `IntRange`) and lists of choices with [Optuna](https://optuna.org) instead; install it with `pip install "neoprophet[optuna]"`. In scripts, call `tune` under `if __name__ == "__main__":`, because it uses a process pool.
+
+```python
+# Python
+from prophet import FloatRange
+from prophet.tuning import tune
+
+# Grid search over the 4x4 grid above
+result = tune(df, param_grid=param_grid, horizon='30 days', metric='rmse')
+print(result.best_params)
+
+# Optuna search over continuous ranges
+space = {
+    'changepoint_prior_scale': FloatRange(0.001, 0.5, log=True),
+    'seasonality_prior_scale': FloatRange(0.01, 10.0, log=True),
+}
+result = tune(df, param_grid=space, horizon='30 days', search='optuna', n_trials=40)
+print(result.best_params)
+model = result.best_model()  # fitted on the full history
+```
+
 
 
 The Prophet model has a number of input parameters that one might consider tuning. Here are some general recommendations for hyperparameter tuning that may be a good starting place.

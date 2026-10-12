@@ -27,7 +27,7 @@ from prophet.quick import (
     normalise_input,
 )
 from prophet.plot import SkipAxis, SkipSpecError, skip_axis
-from prophet.tuning import TuningResult, tune
+from prophet.tuning import FloatRange, IntRange, TuningResult, tune
 
 __all__ = [
     "AllNullValuesError",
@@ -35,10 +35,12 @@ __all__ = [
     "DuplicateTimestampsError",
     "ForecastInputError",
     "ForecastResult",
+    "FloatRange",
     "ForecastSummary",
     "FrequencyInferenceError",
     "HorizonError",
     "InsufficientDataError",
+    "IntRange",
     "MissingRegressorValuesError",
     "NonNumericValuesError",
     "Prophet",

@@ -2,7 +2,10 @@
 
 ``tune`` scores every combination of a parameter grid with rolling-origin
 cross-validation (:func:`prophet.diagnostics.cross_validation`), in parallel,
-and returns an immutable :class:`TuningResult`.
+and returns an immutable :class:`TuningResult`. With ``search="optuna"`` it
+samples continuous ranges (:class:`FloatRange`, :class:`IntRange`) and
+categorical choices with Optuna's TPE sampler instead, scored on the same
+windows (needs ``pip install 'neoprophet[optuna]'``).
 
 Example
 -------
@@ -20,12 +23,16 @@ Scripts must guard the entry point, because the process pool uses the
         model = result.best_model()            # fitted on the full history
         forecast = model.predict(model.make_future_dataframe(periods=365))
 
+        result = tune(df, search="optuna", n_trials=40)
+        result.study                           # the optuna.Study, for its plots
+
 Design notes
 ------------
 The module follows a functional core, imperative shell split. Grid
 construction, window derivation, metric ranking and result assembly are pure
 functions. Model fitting and the process pool live only in ``_score_params``
-and ``tune``.
+and ``tune``. Optuna is imported only by :mod:`prophet.tuning_optuna`, which
+``tune`` loads on demand, so ``import prophet`` never needs it.
 """
 
 from __future__ import annotations
@@ -38,17 +45,31 @@ import itertools
 import logging
 import math
 import multiprocessing
+import numbers
 import os
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Final, Iterator, Mapping, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Final,
+    Iterator,
+    Literal,
+    Mapping,
+    Sequence,
+    Union,
+)
 
 import numpy as np
 import pandas as pd
 
 from .diagnostics import cross_validation, generate_cutoffs, performance_metrics
 from .forecaster import Prophet
+
+if TYPE_CHECKING:
+    import optuna
 
 logger: logging.Logger = logging.getLogger("prophet")
 
@@ -64,6 +85,12 @@ METRICS: Final[tuple[str, ...]] = (
 
 # A fold trained on fewer points than this says nothing about the parameters.
 MIN_TRAIN_POINTS: Final[int] = 10
+
+# Roughly the cost of the default grid (32 combinations plus the baseline).
+DEFAULT_N_TRIALS: Final[int] = 40
+
+Search = Literal["grid", "optuna"]
+SEARCHES: Final[tuple[str, ...]] = ("grid", "optuna")
 
 _YEAR: Final[pd.Timedelta] = pd.Timedelta(days=365.25)
 _WEEK: Final[pd.Timedelta] = pd.Timedelta(days=7)
@@ -103,12 +130,75 @@ class CVWindows:
 
 @dataclass(frozen=True)
 class Trial:
-    """Outcome of cross-validating one parameter combination."""
+    """Outcome of cross-validating one parameter combination.
+
+    ``number`` is the Optuna trial number (``None`` in grid search, and for a
+    baseline outside the search space). A ``pruned`` trial was stopped after
+    some folds, so its metrics cover only those folds.
+    """
 
     params: dict[str, Any]
     metrics: dict[str, float]
     seconds: float
     is_default: bool = False
+    number: int | None = None
+    pruned: bool = False
+
+
+@dataclass(frozen=True)
+class FloatRange:
+    """Continuous search range for ``search="optuna"``, both ends included.
+
+    ``log=True`` samples on a log scale, which suits prior scales.
+    """
+
+    low: float
+    high: float
+    log: bool = False
+
+    def __post_init__(self) -> None:
+        bounds = (self.low, self.high)
+        if not all(
+            isinstance(v, numbers.Real) and not isinstance(v, bool) and math.isfinite(v)
+            for v in bounds
+        ):
+            raise ValueError(f"FloatRange bounds must be finite numbers, got {self}.")
+        if self.low > self.high:
+            raise ValueError(f"FloatRange needs low <= high, got {self}.")
+        if self.log and self.low <= 0:
+            raise ValueError(f"FloatRange(log=True) needs low > 0, got {self}.")
+
+
+@dataclass(frozen=True)
+class IntRange:
+    """Integer search range for ``search="optuna"``, both ends included.
+
+    Values are ``low, low + step, ...`` up to ``high``. ``log=True`` needs
+    ``step=1``, as in Optuna.
+    """
+
+    low: int
+    high: int
+    log: bool = False
+    step: int = 1
+
+    def __post_init__(self) -> None:
+        values = (self.low, self.high, self.step)
+        if not all(
+            isinstance(v, numbers.Integral) and not isinstance(v, bool) for v in values
+        ):
+            raise ValueError(f"IntRange bounds and step must be integers, got {self}.")
+        if self.low > self.high:
+            raise ValueError(f"IntRange needs low <= high, got {self}.")
+        if self.step < 1:
+            raise ValueError(f"IntRange needs step >= 1, got {self}.")
+        if self.log and (self.low < 1 or self.step != 1):
+            raise ValueError(f"IntRange(log=True) needs low >= 1 and step=1, got {self}.")
+
+
+# One parameter's candidates: a range, or a sequence of categorical choices.
+SearchDimension = Union[FloatRange, IntRange, tuple[Any, ...]]
+SearchSpace = dict[str, SearchDimension]
 
 
 @dataclass(frozen=True)
@@ -128,6 +218,11 @@ class TuningResult:
     prophet_kwargs: Fixed ``Prophet`` arguments supplied by the caller.
     regressors: Names of extra regressors added to every model.
     seed: Seed used for every combination.
+    study: The ``optuna.Study`` behind ``search="optuna"`` (``None`` for grid
+        search), for Optuna's own analysis such as
+        ``optuna.visualization.plot_param_importances(result.study)``. With
+        Optuna, ``scores`` also has ``trial`` (the Optuna trial number) and
+        ``pruned`` columns; pruned trials rank after all completed ones.
 
     Why ``best_model()`` and not a fitted attribute: tuning returns plain
     data, and fitting on the full history costs about one extra second per
@@ -143,6 +238,7 @@ class TuningResult:
     regressors: tuple[str, ...]
     seed: int
     history: pd.DataFrame = field(repr=False, compare=False)
+    study: optuna.Study | None = field(default=None, repr=False, compare=False)
 
     @property
     def cutoffs(self) -> tuple[pd.Timestamp, ...]:
@@ -185,13 +281,61 @@ def default_param_grid() -> dict[str, tuple[Any, ...]]:
     }
 
 
+def default_search_space() -> SearchSpace:
+    """Default ``search="optuna"`` space: the default grid's parameters as ranges.
+
+    The prior scale ranges are the ones the Prophet documentation suggests,
+    sampled on a log scale because both act as regularisation penalties.
+    Prophet's defaults (0.05, 10.0, ``"additive"``) lie inside the space.
+    """
+    return {
+        "changepoint_prior_scale": FloatRange(0.001, 0.5, log=True),
+        "seasonality_prior_scale": FloatRange(0.01, 10.0, log=True),
+        "seasonality_mode": ("additive", "multiplicative"),
+    }
+
+
 def _prophet_parameter_names() -> frozenset[str]:
     names = inspect.signature(Prophet.__init__).parameters
     return frozenset(n for n in names if n != "self")
 
 
+def _check_names(names: Sequence[str], prophet_kwargs: Mapping[str, Any] | None) -> None:
+    if not names:
+        raise ValueError("param_grid must contain at least one parameter.")
+    valid = _prophet_parameter_names()
+    unknown = sorted(set(names) - valid)
+    if unknown:
+        raise ValueError(
+            f"Unknown Prophet parameter(s) in param_grid: {unknown}. "
+            f"Valid names are: {sorted(valid)}."
+        )
+    clash = sorted(set(names) & set(prophet_kwargs or {}))
+    if clash:
+        raise ValueError(
+            f"Parameter(s) {clash} appear in both param_grid and prophet_kwargs. "
+            "Keep them in one place."
+        )
+
+
+def _check_choices(name: str, values: object) -> tuple[Any, ...]:
+    if isinstance(values, (FloatRange, IntRange)):
+        raise ValueError(
+            f"param_grid[{name!r}] is a {type(values).__name__}, which only "
+            "search='optuna' can sample. Use a list of values for grid search."
+        )
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValueError(
+            f"param_grid[{name!r}] must be a list or tuple of candidate values, "
+            f"got {type(values).__name__}."
+        )
+    if len(values) == 0:
+        raise ValueError(f"param_grid[{name!r}] is empty.")
+    return tuple(values)
+
+
 def validate_param_grid(
-    param_grid: Mapping[str, Sequence[Any]],
+    param_grid: Mapping[str, Sequence[Any] | FloatRange | IntRange],
     prophet_kwargs: Mapping[str, Any] | None = None,
 ) -> dict[str, tuple[Any, ...]]:
     """Check a grid against ``Prophet.__init__`` and return a normalised copy.
@@ -202,32 +346,101 @@ def validate_param_grid(
         a name is also fixed in ``prophet_kwargs``, or a value list is empty
         or not a sequence.
     """
-    if not param_grid:
-        raise ValueError("param_grid must contain at least one parameter.")
-    valid = _prophet_parameter_names()
-    unknown = sorted(set(param_grid) - valid)
-    if unknown:
-        raise ValueError(
-            f"Unknown Prophet parameter(s) in param_grid: {unknown}. "
-            f"Valid names are: {sorted(valid)}."
-        )
-    clash = sorted(set(param_grid) & set(prophet_kwargs or {}))
-    if clash:
-        raise ValueError(
-            f"Parameter(s) {clash} appear in both param_grid and prophet_kwargs. "
-            "Keep them in one place."
-        )
-    out: dict[str, tuple[Any, ...]] = {}
-    for name, values in param_grid.items():
-        if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+    _check_names(list(param_grid), prophet_kwargs)
+    return {name: _check_choices(name, values) for name, values in param_grid.items()}
+
+
+def _is_plain_choice(value: object) -> bool:
+    return value is None or isinstance(value, (bool, int, float, str))
+
+
+def validate_search_space(
+    space: Mapping[str, Sequence[Any] | FloatRange | IntRange],
+    prophet_kwargs: Mapping[str, Any] | None = None,
+) -> SearchSpace:
+    """Check a ``search="optuna"`` space and return a normalised copy.
+
+    Each value is a :class:`FloatRange`, an :class:`IntRange` or a list of
+    categorical choices. Choices must be ``None``, bool, int, float or str,
+    which is what Optuna can store; anything else (a holidays frame, say)
+    belongs in grid search or ``prophet_kwargs``.
+
+    Raises
+    ------
+    ValueError: As :func:`validate_param_grid`, or for a choice of another type.
+    """
+    _check_names(list(space), prophet_kwargs)
+
+    def normalise(name: str, values: object) -> SearchDimension:
+        if isinstance(values, (FloatRange, IntRange)):
+            return values
+        choices = _check_choices(name, values)
+        odd = [c for c in choices if not _is_plain_choice(c)]
+        if odd:
             raise ValueError(
-                f"param_grid[{name!r}] must be a list or tuple of candidate values, "
-                f"got {type(values).__name__}."
+                f"param_grid[{name!r}] has choices Optuna cannot store: {odd!r}. "
+                "Use None, bool, int, float or str, or search='grid'."
             )
-        if len(values) == 0:
-            raise ValueError(f"param_grid[{name!r}] is empty.")
-        out[name] = tuple(values)
-    return out
+        # Optuna stores a choice as its index, found with ==, so choices that
+        # compare equal would be learned as one (True == 1, 1 == 1.0).
+        equal = [
+            (a, b)
+            for i, a in enumerate(choices)
+            for b in choices[i + 1 :]
+            if a == b
+        ]
+        if equal:
+            raise ValueError(
+                f"param_grid[{name!r}] has choices that compare equal, which "
+                f"Optuna cannot tell apart: {equal!r}. Keep one of each pair, "
+                "or use search='grid'."
+            )
+        return choices
+
+    return {name: normalise(name, values) for name, values in space.items()}
+
+
+def _same_choice(value: object, choice: object) -> bool:
+    # True == 1 and 1 == 1.0 in Python, but Prophet treats them differently.
+    return type(value) is type(choice) and value == choice
+
+
+def _in_dimension(value: object, dim: SearchDimension) -> bool:
+    if isinstance(value, bool):
+        return not isinstance(dim, (FloatRange, IntRange)) and any(
+            _same_choice(value, c) for c in dim
+        )
+    if isinstance(dim, FloatRange):
+        return isinstance(value, numbers.Real) and dim.low <= float(value) <= dim.high
+    if isinstance(dim, IntRange):
+        if not isinstance(value, numbers.Integral):
+            return False
+        number = int(value)
+        return dim.low <= number <= dim.high and (number - dim.low) % dim.step == 0
+    return any(_same_choice(value, c) for c in dim)
+
+
+def space_contains(space: Mapping[str, SearchDimension], params: Mapping[str, Any]) -> bool:
+    """Whether ``params`` names exactly the space's parameters, each within range."""
+    return set(params) == set(space) and all(
+        _in_dimension(params[name], dim) for name, dim in space.items()
+    )
+
+
+def _dimension_size(dim: SearchDimension) -> int | None:
+    if isinstance(dim, FloatRange):
+        return None
+    if isinstance(dim, IntRange):
+        return (dim.high - dim.low) // dim.step + 1
+    return len(dim)
+
+
+def space_size(space: Mapping[str, SearchDimension]) -> int | None:
+    """Number of distinct points, or ``None`` if a dimension is continuous."""
+    sizes = [_dimension_size(dim) for dim in space.values()]
+    if any(s is None for s in sizes):
+        return None
+    return math.prod(s for s in sizes if s is not None)
 
 
 def expand_grid(param_grid: Mapping[str, Sequence[Any]]) -> list[dict[str, Any]]:
@@ -440,20 +653,32 @@ def trial_score(
 def rank_trials(
     trials: Sequence[Trial], metric: str, interval_width: float = 0.8
 ) -> list[Trial]:
-    """Sort trials best first. Ties keep grid order; NaN scores go last."""
+    """Sort trials best first. Ties keep input order; NaN scores go last.
 
-    def key(indexed: tuple[int, Trial]) -> tuple[bool, float, int]:
+    Pruned trials follow every completed trial (even one with a NaN score),
+    because their metrics cover fewer folds and so cannot be compared.
+    """
+
+    def key(indexed: tuple[int, Trial]) -> tuple[bool, bool, float, int]:
         idx, trial = indexed
         score = trial_score(trial.metrics, metric, interval_width)
-        return (math.isnan(score), 0.0 if math.isnan(score) else score, idx)
+        nan = math.isnan(score)
+        return (trial.pruned, nan, 0.0 if nan else score, idx)
 
     return [t for _, t in sorted(enumerate(trials), key=key)]
 
 
 def scores_frame(
-    ranked: Sequence[Trial], metric: str, interval_width: float = 0.8
+    ranked: Sequence[Trial],
+    metric: str,
+    interval_width: float = 0.8,
+    *,
+    optuna_columns: bool = False,
 ) -> pd.DataFrame:
-    """Tidy table from already ranked trials."""
+    """Tidy table from already ranked trials.
+
+    ``optuna_columns`` adds ``trial`` (nullable integer) and ``pruned``.
+    """
     rows = [
         {
             **t.params,
@@ -462,10 +687,14 @@ def scores_frame(
             "rank": rank,
             "seconds": t.seconds,
             "is_default": t.is_default,
+            **({"trial": t.number, "pruned": t.pruned} if optuna_columns else {}),
         }
         for rank, t in enumerate(ranked, start=1)
     ]
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    if optuna_columns:
+        frame["trial"] = frame["trial"].astype("Int64")
+    return frame
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +790,60 @@ def _score_params(task: _Task) -> Trial:
     )
 
 
+def _score_params_by_fold(
+    task: _Task, should_stop: Callable[[int, Mapping[str, float]], bool]
+) -> Trial:
+    """Cross-validate one combination fold by fold, so a pruner can stop it.
+
+    After every fold but the last (stopping then would save nothing),
+    ``should_stop(step, metrics)`` receives the 0-based fold index and the
+    metrics pooled over the folds so far; ``True`` ends the trial as pruned.
+    A trial that runs to the end gets the same metrics as ``_score_params``,
+    because the folds run in the same order from the same RNG seed.
+    """
+
+    def fail(exc: Exception) -> TuningError:
+        return TuningError(f"Cross-validation failed for {task.params}: {exc}")
+
+    start = time.perf_counter()
+    try:
+        with _quiet_cmdstan():
+            np.random.seed(task.seed)
+            model = _build_model(task.prophet_kwargs, task.params, task.regressors)
+            model.fit(task.df)
+    except Exception as exc:
+        raise fail(exc) from exc
+    folds: list[pd.DataFrame] = []
+    metrics: dict[str, float] = {}
+    last = task.windows.n_folds - 1
+    for step, cutoff in enumerate(task.windows.cutoffs):
+        try:
+            with _quiet_cmdstan():
+                folds.append(
+                    cross_validation(
+                        model,
+                        horizon=task.windows.horizon,
+                        cutoffs=[cutoff],
+                        disable_tqdm=True,
+                    )
+                )
+                metrics = _overall_metrics(pd.concat(folds, ignore_index=True))
+        except Exception as exc:
+            raise fail(exc) from exc
+        # The callback runs outside the try so its own errors are not
+        # reported as cross-validation failures.
+        if step < last and should_stop(step, metrics):
+            return Trial(
+                params=task.params,
+                metrics=metrics,
+                seconds=time.perf_counter() - start,
+                pruned=True,
+            )
+    return Trial(
+        params=task.params, metrics=metrics, seconds=time.perf_counter() - start
+    )
+
+
 def _mp_context() -> multiprocessing.context.BaseContext:
     # Same choice as prophet.diagnostics: fork is unsafe with Stan on macOS.
     if sys.platform.startswith("win") or sys.platform == "darwin":
@@ -596,10 +879,54 @@ def _prepare_frame(df: pd.DataFrame, regressors: Sequence[str]) -> pd.DataFrame:
     return out.sort_values("ds").reset_index(drop=True)
 
 
+def _check_search_options(
+    search: str,
+    n_trials: int | None,
+    timeout: float | None,
+    prune: bool,
+    parallel: bool,
+) -> int:
+    """Validate the Optuna-only arguments and return the number of trials."""
+    if search not in SEARCHES:
+        raise ValueError(f"Unknown search {search!r}. Valid values: {list(SEARCHES)}.")
+    if search == "grid":
+        given = [
+            name
+            for name, is_set in (
+                ("n_trials", n_trials is not None),
+                ("timeout", timeout is not None),
+                ("prune", prune),
+            )
+            if is_set
+        ]
+        if given:
+            raise ValueError(f"{given} only apply to search='optuna'.")
+        return 0
+    trials = DEFAULT_N_TRIALS if n_trials is None else n_trials
+    if isinstance(trials, bool) or not isinstance(trials, numbers.Integral):
+        raise ValueError(f"n_trials must be an integer, got {trials!r}.")
+    if trials < 1:
+        raise ValueError(f"n_trials must be at least 1, got {trials}.")
+    if timeout is not None and (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, numbers.Real)
+        or not timeout > 0
+    ):
+        raise ValueError(
+            f"timeout must be a positive number of seconds, got {timeout!r}."
+        )
+    if prune and parallel:
+        raise ValueError(
+            "prune=True scores one trial at a time, because the pruner must see "
+            "each fold's score before the next fold runs. Pass parallel=False."
+        )
+    return int(trials)
+
+
 def tune(
     df: pd.DataFrame,
     *,
-    param_grid: Mapping[str, Sequence[Any]] | None = None,
+    param_grid: Mapping[str, Sequence[Any] | FloatRange | IntRange] | None = None,
     horizon: str | pd.Timedelta | None = None,
     initial: str | pd.Timedelta | None = None,
     period: str | pd.Timedelta | None = None,
@@ -612,37 +939,70 @@ def tune(
     min_folds: int = 3,
     max_folds: int = 10,
     include_defaults: bool = True,
+    search: Search = "grid",
+    n_trials: int | None = None,
+    timeout: float | None = None,
+    prune: bool = False,
 ) -> TuningResult:
     """Pick the Prophet hyperparameters with the best cross-validated score.
 
-    Every combination of ``param_grid`` is fitted and scored on the same
-    rolling-origin windows, then ranked by ``metric``.
+    With ``search="grid"`` (the default) every combination of ``param_grid``
+    is fitted. With ``search="optuna"`` Optuna's TPE sampler proposes
+    ``n_trials`` combinations in batches, each batch informed by the scores
+    of the batches before it. Either way every candidate is scored on the
+    same rolling-origin windows and ranked by ``metric``.
 
     Parameters
     ----------
     df: History with columns ``ds`` and ``y`` (plus ``cap``/``floor`` for
         logistic growth and any ``regressors``).
     param_grid: Mapping of ``Prophet`` argument name to candidate values.
-        Defaults to :func:`default_param_grid`. Names are validated against
-        ``Prophet.__init__``.
+        Names are validated against ``Prophet.__init__``. For grid search the
+        values are lists, and the default is :func:`default_param_grid`. For
+        ``search="optuna"`` a value may also be a :class:`FloatRange` or
+        :class:`IntRange` (lists become categorical choices), and the default
+        is :func:`default_search_space`.
     horizon, initial, period: Cross-validation windows, as in
         :func:`prophet.diagnostics.cross_validation`. Omitted ones are derived
         from the data, see :func:`derive_windows`.
     metric: One of ``mse, rmse, mae, mape, mdape, smape, coverage``. Lower is
         better, except ``coverage`` where closeness to ``interval_width`` wins.
     parallel: Score combinations in a process pool (one process per
-        combination, each running its folds sequentially).
+        combination, each running its folds sequentially). With
+        ``search="optuna"`` the pool scores one batch of trials at a time,
+        one trial per worker. Trials in a batch do not see each other's
+        scores, so a smaller pool searches better and a larger one faster.
     max_workers: Pool size. Defaults to the CPU count, capped at the number of
-        combinations.
+        combinations. With Optuna the default is also capped at
+        ``n_trials // 4``, leaving at least four informed rounds.
     seed: Seeds numpy's global RNG before every combination so uncertainty
-        sampling, and therefore ``coverage``, is reproducible.
+        sampling, and therefore ``coverage``, is reproducible. Also seeds the
+        Optuna sampler: with the same ``seed``, ``n_trials`` and pool size,
+        Optuna proposes the same trials. The default pool depends on the CPU
+        count, so set ``max_workers`` to reproduce a search on other machines.
     prophet_kwargs: Fixed ``Prophet`` arguments (holidays, growth, ...).
     regressors: Columns of ``df`` to add with ``add_regressor`` defaults.
     min_folds, max_folds: Bounds on the number of derived folds.
     include_defaults: Also score Prophet's default values for the tuned
         parameters (flagged in ``scores['is_default']``), so the result can
         be compared against untuned Prophet and never loses to it in
-        cross-validation.
+        cross-validation. With Optuna this is one extra evaluation on top of
+        ``n_trials``, and it is added to the study when it lies inside the
+        search space.
+    search: ``"grid"`` or ``"optuna"``. Optuna needs
+        ``pip install 'neoprophet[optuna]'``.
+    n_trials: Number of Optuna trials, default 40 (about the cost of the
+        default grid). Optuna only.
+    timeout: Stop proposing trials after this many seconds. Checked between
+        batches, so the batch running at the deadline still finishes.
+        Optuna only.
+    prune: Stop unpromising Optuna trials early. After each fold from the
+        second to the second-to-last, a trial whose score pooled over its
+        folds so far is worse than the median of completed trials at the same
+        fold is stopped. Pruning starts once 5 trials have completed (the
+        baseline counts as one) and needs at least 3 folds, so it has no
+        effect on very small searches. Needs ``parallel=False``, because the
+        pruner must see each fold before the next one runs.
 
     Returns
     -------
@@ -659,13 +1019,28 @@ def tune(
     >>> result = tune(df, param_grid={"changepoint_prior_scale": [0.01, 0.1]})  # doctest: +SKIP
     >>> result.best_params  # doctest: +SKIP
     {'changepoint_prior_scale': 0.1}
+    >>> space = {"changepoint_prior_scale": FloatRange(0.001, 0.5, log=True)}
+    >>> result = tune(df, param_grid=space, search="optuna", n_trials=30)  # doctest: +SKIP
     """
     if metric not in METRICS:
         raise ValueError(f"Unknown metric {metric!r}. Valid metrics: {list(METRICS)}.")
+    trials_wanted = _check_search_options(search, n_trials, timeout, prune, parallel)
     fixed = dict(prophet_kwargs or {})
-    grid = validate_param_grid(
-        default_param_grid() if param_grid is None else param_grid, fixed
+    grid = (
+        validate_param_grid(
+            default_param_grid() if param_grid is None else param_grid, fixed
+        )
+        if search == "grid"
+        else None
     )
+    space = (
+        validate_search_space(
+            default_search_space() if param_grid is None else param_grid, fixed
+        )
+        if search == "optuna"
+        else None
+    )
+    names = list(grid if grid is not None else space or {})
     frame = _prepare_frame(df, regressors)
     if metric == "mape" and frame["y"].abs().min() < 1e-8:
         raise ValueError(
@@ -690,32 +1065,58 @@ def tune(
 
     # Intervals are only worth sampling when the metric reads them.
     scoring_kwargs = dict(fixed)
-    if metric != "coverage" and "uncertainty_samples" not in grid:
+    if metric != "coverage" and "uncertainty_samples" not in names:
         scoring_kwargs["uncertainty_samples"] = 0
-    combos = expand_grid(grid)
-    baseline_idx = -1
-    if include_defaults:
-        combos, baseline_idx = with_baseline(combos, list(grid))
-    tasks = [
-        _Task(frame, params, scoring_kwargs, tuple(regressors), windows, seed)
-        for params in combos
-    ]
-    trials = [
-        dataclasses.replace(t, is_default=i == baseline_idx)
-        for i, t in enumerate(_run_tasks(tasks, parallel, max_workers))
-    ]
-
     interval_width = float(fixed.get("interval_width", 0.8))
+
+    def make_task(params: dict[str, Any]) -> _Task:
+        return _Task(frame, params, scoring_kwargs, tuple(regressors), windows, seed)
+
+    study: optuna.Study | None = None
+    if grid is not None:
+        combos = expand_grid(grid)
+        baseline_idx = -1
+        if include_defaults:
+            combos, baseline_idx = with_baseline(combos, list(grid))
+        trials = [
+            dataclasses.replace(t, is_default=i == baseline_idx)
+            for i, t in enumerate(
+                _run_tasks([make_task(p) for p in combos], parallel, max_workers)
+            )
+        ]
+    else:
+        assert space is not None
+        # Imported here: Optuna is an optional dependency.
+        from .tuning_optuna import run_study
+
+        trials, study = run_study(
+            make_task,
+            space,
+            n_trials=trials_wanted,
+            timeout=timeout,
+            seed=seed,
+            parallel=parallel,
+            max_workers=max_workers,
+            prune=prune,
+            n_folds=windows.n_folds,
+            baseline=prophet_defaults(names) if include_defaults else None,
+            score=lambda metrics: trial_score(metrics, metric, interval_width),
+        )
+
     ranked = rank_trials(trials, metric, interval_width)
-    if math.isnan(trial_score(ranked[0].metrics, metric, interval_width)):
+    best = ranked[0]
+    if best.pruned or math.isnan(trial_score(best.metrics, metric, interval_width)):
         raise TuningError(f"No combination produced a finite {metric!r} score.")
     return TuningResult(
-        best_params=dict(ranked[0].params),
-        scores=scores_frame(ranked, metric, interval_width),
+        best_params=dict(best.params),
+        scores=scores_frame(
+            ranked, metric, interval_width, optuna_columns=study is not None
+        ),
         metric=metric,
         windows=windows,
         prophet_kwargs=fixed,
         regressors=tuple(regressors),
         seed=seed,
         history=frame,
+        study=study,
     )

@@ -34,7 +34,7 @@ Upstream Prophet is a great model with a dated developer experience. NeoProphet 
 | **Input** | a DataFrame with `ds` and `y` columns | any date and value columns, a Series with a DatetimeIndex, timezone-aware dates, with clear errors for bad data |
 | **Frequency** | you pass `freq` yourself | detected automatically, including irregular series |
 | **Charts** | plain axes and a legend | data-derived titles, history and forecast zones, changepoint callouts, plain-English cross-validation labels |
-| **Tuning** | write your own grid search | `forecast(..., tune=True)` or `prophet.tune(df)`, parallel cross-validation |
+| **Tuning** | write your own grid search | `forecast(..., tune=True)` or `prophet.tune(df)`, parallel cross-validation, plus an optional Optuna search (`tune="optuna"`) |
 | **Regressors** | `add_regressor` plus building future frames by hand | `regressors=["promo"]`, validated future values, `weather="London"` for local temperature |
 | **Closed days** | filter the future frame yourself; charts show empty gaps | `skip_days="weekends"`, `skip_hours=...`, gap-free charts |
 | **Outputs** | forecast and components charts | plus backtest, regressor effects, one-page PDF report and offline HTML dashboard |
@@ -49,6 +49,7 @@ Existing code keeps working: `from prophet import Prophet` is unchanged, and the
 ```bash
 pip install neoprophet            # or: uv add neoprophet
 pip install "neoprophet[mlx]"     # adds the MLX backend on Apple Silicon
+pip install "neoprophet[optuna]"  # adds Optuna hyperparameter search
 ```
 
 NeoProphet installs the `prophet` import package, so it replaces upstream Prophet: uninstall `prophet` first and do not install both in one environment. Wheels include the compiled Stan model for macOS (Intel and Apple Silicon), Linux (x86-64 and ARM64) and Windows.
@@ -86,7 +87,35 @@ result.tuning.best_params   # chosen changepoint and seasonality prior scales, s
 result.tuning.scores        # every combination with its cross-validation metrics
 ```
 
-Tuning searches 33 combinations in parallel and took 6 to 21 seconds per example dataset (about 2 minutes for 18,000 five-minute rows). Cross-validation only sees the past, so treat the result as a starting point: on the 8 example datasets it beat untuned Prophet defaults on 4 and was worse on 2, and hand-chosen settings still won on most. Check `result.tuning.scores` and a holdout before trusting it.
+Grid tuning searches 33 combinations in parallel and took 6 to 21 seconds per example dataset (about 2 minutes for 18,000 five-minute rows). Cross-validation only sees the past, so treat the result as a starting point: on the 8 example datasets it beat untuned Prophet defaults on 4 and was worse on 2, and hand-chosen settings still won on most. Check `result.tuning.scores` and a holdout before trusting it.
+
+For continuous ranges instead of a fixed grid, `tune="optuna"` lets [Optuna](https://optuna.org) propose the combinations, informed by the scores of earlier trials. Optuna is an optional extra:
+
+```bash
+pip install "neoprophet[optuna]"
+```
+
+```python
+result = forecast(df, horizon="12 months", tune="optuna")   # 40 trials over the default ranges
+result.tuning.study   # the optuna.Study
+```
+
+To choose the space yourself, call `tune` with `search="optuna"`. Each value in `param_grid` is a `FloatRange`, an `IntRange` or a list of choices:
+
+```python
+from prophet import FloatRange, IntRange, tune
+
+space = {
+    "changepoint_prior_scale": FloatRange(0.001, 0.5, log=True),   # log=True samples on a log scale
+    "n_changepoints": IntRange(10, 50),
+    "seasonality_mode": ["additive", "multiplicative"],
+}
+result = tune(df, param_grid=space, search="optuna", n_trials=40)
+result.best_params
+result.study   # for Optuna's plots (needs plotly): optuna.visualization.plot_param_importances(result.study)
+```
+
+`n_trials` defaults to 40, and Prophet's defaults are scored as one extra run (`include_defaults=True`) so you can see what tuning gained. `timeout=` (seconds) stops proposing new trials once it has passed. `result.scores` gains `trial` and `pruned` columns. `prune=True` stops a trial partway through cross-validation when its score so far is worse than the median of completed trials at the same fold (from the second fold, once 5 trials have completed); it scores one trial at a time, so it needs `parallel=False`. In scripts, call `forecast` and `tune` under `if __name__ == "__main__":`, because tuning uses a process pool.
 
 ### Regressors, local temperature and skipped days
 
@@ -233,6 +262,7 @@ python/
   prophet/
     quick.py            # forecast(): one-call API, input normalisation, frequency inference
     tuning.py           # tune(): parallel cross-validated hyperparameter search
+    tuning_optuna.py    # Optuna search behind tune(search="optuna"), optional extra
     plot.py             # Default chart style (matplotlib and plotly), gap-free skip_axis()
     visuals.py          # Backtest, regressor effects, one-page report, HTML dashboard
     weather.py          # Open-Meteo temperature: archive, forecast, climatology
@@ -284,7 +314,7 @@ Python and Go share the same Stan model for MAP estimation (L-BFGS, with a Newto
 | `n_changepoints` | 25 | Number of potential changepoint locations |
 | `growth` | linear | `logistic` for saturating growth, `flat` for no trend |
 
-`tune=True` searches the first three for you.
+`tune=True` searches the first three for you over a fixed grid; `tune="optuna"` searches them over continuous ranges.
 
 ## References
 

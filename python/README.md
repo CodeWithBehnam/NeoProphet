@@ -29,6 +29,7 @@ result.plot_components()   # trend, holidays, weekly and yearly patterns
 ```
 
 - `forecast(..., tune=True)` chooses the prior scales and seasonality mode by parallel cross-validation.
+- `forecast(..., tune="optuna")` searches ranges for the two prior scales, and both seasonality modes, with Optuna instead (`pip install "neoprophet[optuna]"`). The Optuna study is `result.tuning.study`. For your own ranges, call `prophet.tune(df, param_grid=..., search="optuna", n_trials=40)` with `FloatRange` and `IntRange`.
 - `prophet.mlx_backend.fit_many(dfs)` fits many series in one batch on an Apple Silicon GPU (experimental; linear and flat growth, MAP only).
 - The classic API is unchanged: `from prophet import Prophet` works as before.
 
