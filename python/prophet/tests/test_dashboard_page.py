@@ -1152,6 +1152,7 @@ def test_narrow_screens_move_legends_under_the_plot_and_wide_ones_put_them_back(
 
 
 def test_the_toolbar_is_hidden_on_narrow_screens(tmp_path: Path) -> None:
+    pytest.importorskip("plotly")
     page = without_bundle(page_for(tmp_path))
     assert "@media (max-width: 640px) { .modebar-container { display: none" in page
 

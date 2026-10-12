@@ -328,13 +328,22 @@ def test_the_weekly_panel_has_only_the_weekdays_the_data_has_and_agrees_with_the
 
 
 def test_the_weekly_sentence_no_longer_names_the_days_the_data_never_has() -> None:
-    # Before the fix: "Thursdays are 29.2 above the usual level and Saturdays 72.6 below it."
+    # data.csv holds Monday to Friday only, so the weekend values of the weekly curve are
+    # extrapolation. Which weekend day the unfixed sentence names, and its numbers, depend on the
+    # optimiser: "Saturdays 72.6 below" on macOS, "Sundays 72.9 below" on Linux x86.
+    weekend = ("Saturday", "Sunday")
     ctx, raw = raw_panels("regressors")
+    assert set(ctx.history["ds"].dt.day_name()).isdisjoint(weekend)
     before = next(s for h, s, f in raw if f.data[0].name == "weekly")
-    assert "Saturdays" in before
+    assert any(day in before for day in weekend)
     after = refined("regressors")["weekly"]
-    assert "Saturdays" not in after.head
-    assert "72.6" not in after.sentence and "29.2" not in after.sentence
+    assert not any(day in after.head for day in weekend)
+    # A weekend day may only appear to say it was left out, never as the high or the low.
+    extreme = re.compile(r"(Saturday|Sunday)s (are )?[+-]?\d[\d.,]* (above|below)")
+    assert not extreme.search(after.sentence)
+    assert "left out" in after.sentence
+    numbers = re.compile(r"\d+(?:\.\d+)?")
+    assert numbers.findall(after.sentence) != numbers.findall(before)
 
 
 def test_yearly_text_matches_the_peak_days_of_the_seasonality_section() -> None:
