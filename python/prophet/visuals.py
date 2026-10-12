@@ -10,7 +10,8 @@ forecast, direct labels, plain-English headlines written from the data):
   forecast, with its fitted coefficient in plain words.
 * :func:`plot_report` is a single A4 page: forecast, key numbers, components
   and regressor effects.
-* :func:`dashboard_html` writes an interactive, self-contained plotly page
+* :func:`dashboard_html` writes an interactive, self-contained plotly page made
+  of the sections in :mod:`prophet.dashboard`, with a light and a dark theme
   (plotly is an optional dependency, imported only there).
 
 The numbers and the wording come from small pure functions
@@ -23,13 +24,14 @@ from __future__ import annotations
 
 import calendar
 import html
+import importlib
 import logging
 import re
 import textwrap
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Callable, Collection, Iterable
 from typing import TYPE_CHECKING, Any, Literal, Mapping, Sequence, cast
 
 import matplotlib as mpl
@@ -44,6 +46,7 @@ from matplotlib.text import Text
 from matplotlib.ticker import FuncFormatter
 from matplotlib.transforms import ScaledTranslation
 
+from prophet.dashboard import _palette
 from prophet.diagnostics import prophet_copy
 from prophet.plot import (
     ACCENT,
@@ -59,7 +62,6 @@ from prophet.plot import (
     SkipAxis,
     _chart_axis,
     _midpoint,
-    _plotly_rangebreaks,
     _skip_note,
     plot,
     plot_forecast_component,
@@ -76,6 +78,7 @@ if TYPE_CHECKING:
     from matplotlib.figure import Figure
     from matplotlib.transforms import Bbox, Transform
 
+    from prophet.dashboard._context import DashboardContext, Section
     from prophet.forecaster import Prophet
 
 logger: logging.Logger = logging.getLogger("prophet.visuals")
@@ -226,20 +229,24 @@ def _pretty(name: str) -> str:
     return text[:1].upper() + text[1:]
 
 
+def _day_month(ts: pd.Timestamp) -> str:
+    """'5 Mar': the day without a leading zero, as the prose of the page writes it."""
+    return f"{ts.day} {ts:%b}"
+
+
 def _fmt_date(ts: pd.Timestamp, span: pd.Timedelta) -> str:
     """Date wording that fits the span of the data: month for years, time for hours."""
     if span >= pd.Timedelta(days=730):
         return f"{ts:%b %Y}"
     if span >= pd.Timedelta(days=60):
-        return f"{ts:%d %b %Y}"
-    return f"{ts:%d %b %H:%M}"
+        return f"{_day_month(ts)} {ts:%Y}"
+    return f"{_day_month(ts)} {ts:%H:%M}"
 
 
 def _fmt_day(ts: pd.Timestamp, step: pd.Timedelta) -> str:
     """A point in time at the resolution of the data."""
-    return (
-        f"{ts:%d %b %Y}" if step >= pd.Timedelta(hours=20) else f"{ts:%d %b %Y %H:%M}"
-    )
+    day = f"{_day_month(ts)} {ts:%Y}"
+    return day if step >= pd.Timedelta(hours=20) else f"{day} {ts:%H:%M}"
 
 
 # Calendar-ish units with their typical length, for naming a spacing or span.
@@ -758,9 +765,24 @@ def regressor_effects(
                 headline=_contribution_range(series, mode == "multiplicative", binary),
             )
         )
-    spread = {e.name: float(_contribution(m, fcst, e.name).abs().max()) for e in out}
+    spread = {e.name: _reach_in_y(m, fcst, e.name, e.mode) for e in out}
     # A stable sort keeps the order the regressors were added in for ties.
     return tuple(sorted(out, key=lambda e: -spread[e.name]))
+
+
+def _reach_in_y(m: Prophet, fcst: pd.DataFrame, name: str, mode: str) -> float:
+    """How far a regressor moves the forecast at most, in the units of y.
+
+    An additive regressor is in those units already. A multiplicative one is a
+    fraction of the trend, so it is scaled by the trend on each date first;
+    ranking the raw numbers would put a regressor that moves y by tens below one
+    that moves it by tenths. Without a trend column the typical size of y stands in.
+    """
+    effect = _contribution(m, fcst, name).abs()
+    if mode == "multiplicative":
+        effect = effect * (fcst["trend"].abs() if "trend" in fcst else _y_scale(m))
+    peak = float(effect.max())
+    return peak if np.isfinite(peak) else 0.0
 
 
 def _coef_figure(effect: RegressorEffect) -> str:
@@ -956,6 +978,8 @@ class _Summary:
     recent_mean: float | None
     window: pd.Timedelta | None
     scale: float
+    y_min: float = float("nan")
+    y_max: float = float("nan")
 
 
 def _summarise(m: Prophet, fcst: pd.DataFrame, df: pd.DataFrame | None) -> _Summary:
@@ -991,6 +1015,8 @@ def _summarise(m: Prophet, fcst: pd.DataFrame, df: pd.DataFrame | None) -> _Summ
         recent_mean=recent,
         window=window,
         scale=_y_scale(m),
+        y_min=float(observed["y"].min()),
+        y_max=float(observed["y"].max()),
     )
 
 
@@ -1075,6 +1101,34 @@ def _metric_tiles(metrics: BacktestMetrics) -> list[Tile]:
     return tiles
 
 
+#: A forecast average this far (as a share of the range of the data) outside that range is called out.
+_OUTSIDE_RANGE = 0.25
+
+
+def _range_warning(s: _Summary) -> str:
+    """A sentence when the forecast average lies well outside every value the data has shown, else nothing.
+
+    A negative average for data that never goes below zero is called out at any
+    distance. A trend can carry a forecast past the old extremes, so the other
+    cases need a clear margin before they count.
+    """
+    mean, low, high = s.forecast_mean, s.y_min, s.y_max
+    if mean is None or not (np.isfinite(low) and np.isfinite(high)):
+        return ""
+    margin = _OUTSIDE_RANGE * (high - low)
+    if mean < low - margin or (low >= 0 and mean < 0):
+        return (
+            f"That average is below every value in the history (the lowest is {_fmt_number(low)}), "
+            "so check the model before relying on the forecast."
+        )
+    if mean > high + margin:
+        return (
+            f"That average is above every value in the history (the highest is {_fmt_number(high)}), "
+            "so check the model before relying on the forecast."
+        )
+    return ""
+
+
 def _report_headline(
     m: Prophet, s: _Summary, skip: SkipAxis | None = None
 ) -> tuple[str, str]:
@@ -1089,6 +1143,9 @@ def _report_headline(
     compare = _compare_sentence(s)
     title = f"Forecast report: {ahead}" + (f" look {compare}" if compare else "")
     sub = f"The forecast averages {_fmt_number(s.forecast_mean)} over {ahead}."
+    warning = _range_warning(s)
+    if warning:
+        sub += f" {warning}"
     if m.uncertainty_samples:
         sub += f" Shaded bands show the range the real value should land in {m.interval_width:.0%} of the time."
     return title, f"{sub} {facts}"
@@ -3401,28 +3458,8 @@ def _regressor_figure(
     return fig
 
 
-_PAGE_CSS = f"""
-:root {{ color-scheme: light; }}
-* {{ box-sizing: border-box; }}
-body {{ margin: 0; background: {PAPER}; color: {INK}; font-family: {_CSS_SANS}; line-height: 1.45; }}
-main {{ max-width: 1080px; margin: 0 auto; padding: 0 20px 48px; }}
-.bar {{ height: 8px; width: 56px; background: {ACCENT}; margin-bottom: 22px; }}
-h1 {{ font-family: {_CSS_SERIF}; font-size: 30px; line-height: 1.2; margin: 0 0 10px; }}
-.sub {{ color: {INK_SOFT}; font-size: 15px; max-width: 760px; margin: 0 0 26px; }}
-h2 {{ font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: {INK_SOFT};
-     border-bottom: 1px solid {GRID}; padding-bottom: 6px; margin: 34px 0 12px; }}
-.tiles {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; }}
-.tile {{ border-top: 2px solid {INK}; padding-top: 8px; }}
-.tile .l {{ font-size: 11px; font-weight: 700; letter-spacing: .06em; color: {INK_SOFT}; }}
-.tile .v {{ font-family: {_CSS_SERIF}; font-size: 24px; font-weight: 700; margin: 2px 0; }}
-.tile .d {{ font-size: 13px; color: {INK_SOFT}; }}
-.cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 8px; }}
-.card {{ border-left: 2px solid {GRID}; padding-left: 14px; }}
-.card .n {{ font-family: {_CSS_SERIF}; font-size: 22px; font-weight: 700; }}
-.card .t {{ font-size: 13px; color: {INK_SOFT}; }}
-.note {{ font-size: 13px; color: {INK_SOFT}; margin: 4px 0 0; }}
-.foot {{ margin-top: 40px; font-size: 12px; color: {INK_SOFT}; }}
-"""
+def _css_tokens(tokens: Mapping[str, str]) -> str:
+    return " ".join(f"--{name}: {value};" for name, value in tokens.items())
 
 
 def _tiles_html(tiles: Sequence[Tile]) -> str:
@@ -3449,16 +3486,423 @@ def _cards_html(rows: Sequence[_RegressorRow]) -> str:
     return f'<div class="cards">{"".join(cells)}</div>'
 
 
+#: Everything below styles through custom properties, so a theme is just a set of tokens.
+_PAGE_CSS = f"""
+:root {{ {_css_tokens(_palette.LIGHT)} color-scheme: light; --bar: 45px; scroll-padding-top: calc(var(--bar) + 10px); }}
+:root[data-theme="dark"] {{ {_css_tokens(_palette.DARK)} color-scheme: dark; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: var(--paper); color: var(--ink); font-family: {_CSS_SANS}; line-height: 1.45; }}
+main {{ max-width: 1080px; margin: 0 auto; padding: 0 20px 48px; }}
+a {{ color: inherit; }}
+a:focus-visible, button:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
+.skip {{ position: absolute; left: -9999px; top: 0; background: var(--ink); color: var(--paper); padding: 8px 12px; z-index: 30; }}
+.skip:focus {{ left: 8px; top: 8px; }}
+.topbar {{ position: sticky; top: 0; z-index: 20; background: var(--paper); border-bottom: 1px solid var(--grid); }}
+.topbar-in {{ max-width: 1080px; margin: 0 auto; padding: 0 20px; display: flex; align-items: center; gap: 12px; min-height: 44px; }}
+.topbar nav {{ position: relative; flex: 1 1 auto; min-width: 0; display: flex; overflow-x: auto; scrollbar-width: none;
+              --fade-l: 0px; --fade-r: 0px;
+              -webkit-mask-image: linear-gradient(to right, transparent, #000 var(--fade-l), #000 calc(100% - var(--fade-r)), transparent);
+              mask-image: linear-gradient(to right, transparent, #000 var(--fade-l), #000 calc(100% - var(--fade-r)), transparent); }}
+.topbar nav::-webkit-scrollbar {{ display: none; }}
+.topbar nav.more-l {{ --fade-l: 28px; }}
+.topbar nav.more-r {{ --fade-r: 28px; }}
+.topbar nav a {{ flex: none; padding: 12px 7px 10px; font-size: 12.5px; color: var(--ink-soft); text-decoration: none; border-bottom: 2px solid transparent; }}
+.topbar nav a:hover, .topbar nav a[aria-current="true"] {{ color: var(--ink); border-bottom-color: var(--accent); }}
+.topbar nav a:focus-visible {{ outline-offset: -2px; }}
+.btn {{ flex: none; margin-left: auto; font: inherit; font-size: 12px; font-weight: 700; letter-spacing: .04em; color: var(--ink); background: var(--history-tint);
+       border: 1px solid var(--grid); border-radius: 2px; padding: 6px 12px; cursor: pointer; }}
+.btn:hover {{ background: var(--forecast-tint); }}
+.btn[aria-pressed="true"] {{ background: var(--ink); color: var(--paper); border-color: var(--ink); }}
+.bar {{ height: 8px; width: 56px; background: var(--accent); margin: 22px 0; }}
+h1 {{ font-family: {_CSS_SERIF}; font-size: 30px; line-height: 1.2; margin: 0 0 10px; }}
+h1, h2, h3, .sub, .lede, .note, .foot, .tile, .card, .findings li {{ overflow-wrap: anywhere; }}
+.sub {{ color: var(--ink-soft); font-size: 15px; max-width: 760px; margin: 0 0 26px; }}
+h2 {{ font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-soft);
+     border-bottom: 1px solid var(--grid); padding-bottom: 6px; margin: 34px 0 12px; }}
+h3 {{ font-family: {_CSS_SERIF}; font-size: 16px; line-height: 1.3; margin: 22px 0 6px; }}
+.lede {{ font-size: 16px; max-width: 760px; margin: 0 0 14px; }}
+.note {{ font-size: 13px; color: var(--ink-soft); margin: 4px 0 0; }}
+.tiles {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; }}
+.tile {{ border-top: 2px solid var(--ink); padding-top: 8px; }}
+.tile .l {{ font-size: 11px; font-weight: 700; letter-spacing: .06em; color: var(--ink-soft); }}
+.tile .v {{ font-family: {_CSS_SERIF}; font-size: 24px; font-weight: 700; margin: 2px 0; }}
+.tile .d {{ font-size: 13px; color: var(--ink-soft); }}
+.findings {{ list-style: none; margin: 0; padding: 0; display: grid; gap: 14px 32px; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); }}
+.findings li {{ border-left: 2px solid var(--grid); padding-left: 14px; font-size: 14px; }}
+.findings a {{ display: block; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-soft); text-decoration: none; }}
+.findings a:hover {{ color: var(--accent); }}
+.cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 8px; }}
+.card {{ border-left: 2px solid var(--grid); padding-left: 14px; }}
+.card .n {{ font-family: {_CSS_SERIF}; font-size: 22px; font-weight: 700; }}
+.card .t {{ font-size: 13px; color: var(--ink-soft); }}
+.grid2 {{ display: grid; grid-template-columns: 1fr; gap: 16px 28px; }}
+.grid2 > div {{ min-width: 0; }}
+@media (min-width: 760px) {{ .grid2 {{ grid-template-columns: 1fr 1fr; }} }}
+.tbl-wrap {{ overflow-x: auto; margin: 8px 0; }}
+.tbl-wrap.scroll {{ max-height: 420px; overflow-y: auto; }}
+.tbl {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+.tbl th {{ font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-soft); text-align: left;
+          padding: 6px 12px 6px 0; border-bottom: 2px solid var(--ink); white-space: nowrap; }}
+.tbl td {{ padding: 6px 12px 6px 0; border-bottom: 1px solid var(--grid); vertical-align: top; }}
+.tbl th.num, .tbl td.num {{ text-align: right; font-variant-numeric: tabular-nums; padding-right: 0; padding-left: 12px; }}
+.tbl-wrap.scroll .tbl thead th {{ position: sticky; top: 0; background: var(--paper); z-index: 1; }}
+.kv {{ margin: 8px 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 0 32px; font-size: 13px; }}
+.kv > div {{ display: grid; grid-template-columns: minmax(110px, 40%) 1fr; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--grid); }}
+.kv dt {{ color: var(--ink-soft); }}
+.kv dd {{ margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }}
+pre, code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }}
+code {{ background: var(--history-tint); padding: 1px 4px; border-radius: 2px; }}
+pre {{ background: var(--history-tint); border-left: 2px solid var(--grid); padding: 10px 12px; overflow-x: auto; margin: 8px 0; }}
+pre code {{ background: none; padding: 0; }}
+.foot {{ margin-top: 40px; font-size: 12px; color: var(--ink-soft); }}
+.theme-pending .plotly-graph-div {{ visibility: hidden; }}
+@media (max-width: 520px) {{
+  h1 {{ font-size: 25px; }}
+  .tile .v {{ font-size: 21px; }}
+}}
+/* Touch screens keep the toolbar showing, where it covers the legend; pinch and double-tap still zoom and reset. */
+@media (max-width: 640px) {{ .modebar-container {{ display: none !important; }} }}
+@media print {{
+  .topbar, .skip, .btn, .modebar-container {{ display: none !important; }}
+  body {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+  main {{ max-width: none; padding: 0; }}
+  .js-plotly-plot, .plotly-graph-div, .tbl-wrap, .tile, .card, .findings li, pre {{ break-inside: avoid; page-break-inside: avoid; }}
+  .tbl-wrap.scroll {{ max-height: none; overflow: visible; }}
+  h2 {{ break-after: avoid; page-break-after: avoid; }}
+}}
+"""
+
+#: For theme="auto" without scripts: follow the system until the script settles the theme.
+_AUTO_CSS = (
+    '\n@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { '
+    + _css_tokens(_palette.DARK)
+    + " color-scheme: dark; } }\n"
+)
+
+#: Last in the stylesheet: a page in the dark theme still prints dark ink on light paper.
+_PRINT_CSS = (
+    '\n@media print { :root, :root[data-theme="dark"], :root:not([data-theme="light"]) { '
+    + _css_tokens(_palette.LIGHT)
+    + " color-scheme: light; } }\n"
+)
+
+_THEMES: tuple[str, ...] = ("light", "dark", "auto")
+DashboardTheme = Literal["light", "dark", "auto"]
+
+
+def _check_theme(theme: str) -> None:
+    if theme not in _THEMES:
+        raise ValueError(f"theme must be one of {list(_THEMES)}, not {theme!r}.")
+
+
+def _resolve_sections(
+    requested: Sequence[str] | None, valid: Sequence[str]
+) -> tuple[str, ...]:
+    """The section keys to build, in order: all of ``valid`` for None, else exactly ``requested``."""
+    if requested is None:
+        return tuple(valid)
+    if isinstance(requested, str):
+        raise ValueError(
+            f"sections must be a list of keys, not the single string {requested!r}; "
+            f"valid sections are {list(valid)}."
+        )
+    keys = tuple(requested)
+    unknown = [k for k in keys if k not in valid]
+    if unknown:
+        raise ValueError(
+            f"Unknown dashboard section(s) {unknown}; valid sections are {list(valid)}."
+        )
+    repeated = sorted({k for k in keys if keys.count(k) > 1})
+    if repeated:
+        raise ValueError(
+            f"Dashboard section(s) {repeated} listed more than once; "
+            f"list each of {list(valid)} at most once."
+        )
+    return keys
+
+
+def _sorted_by_date(
+    fcst: pd.DataFrame, sources: Sequence[object] | pd.Series | None
+) -> tuple[pd.DataFrame, Sequence[object] | pd.Series | None]:
+    """The forecast in date order, with weather-source labels moved along with their rows."""
+    if fcst["ds"].is_monotonic_increasing:
+        return fcst, sources
+    order = np.argsort(fcst["ds"].to_numpy(), kind="stable")
+    if sources is not None:
+        sources = _align_sources(fcst, sources).iloc[order].reset_index(drop=True)
+    return fcst.iloc[order].reset_index(drop=True), sources
+
+
+def _regressors_summary(rows: Sequence[_RegressorRow]) -> str:
+    """One sentence for the key findings: the strongest regressor and how far it moves the forecast.
+
+    Rows are ranked by how far a regressor moves the forecast, so the sentence says that
+    too. The per-unit coefficient is no guide here: a regressor on a large scale can
+    move the forecast a lot with a tiny coefficient.
+    """
+    if not rows:
+        return ""
+    top = rows[0].effect
+    label = top.name.replace("_", " ")
+    reach = top.headline[:1].lower() + top.headline[1:]
+    if reach.startswith("moves "):
+        reach = f"it {reach}"
+    if len(rows) == 1:
+        return f"Extra regressor {label}: {reach}"
+    return f"Of {len(rows)} extra regressors, {label} matters most: {reach}"
+
+
+def _findings_html(sections: Sequence[Section]) -> str:
+    """The key findings list: one line per section that has a summary, linked to its section."""
+    items = "".join(
+        f'<li><a href="#{html.escape(s.key)}">{html.escape(s.title)}</a>{html.escape(s.summary.strip())}</li>'
+        for s in sections
+        if s.summary.strip()
+    )
+    return f'<h2>Key findings</h2><ul class="findings">{items}</ul>' if items else ""
+
+
+def _nav_html(sections: Sequence[Section]) -> str:
+    links = "".join(
+        f'<a href="#{html.escape(s.key)}">{html.escape(s.title)}</a>' for s in sections
+    )
+    return f'<nav aria-label="Sections">{links}</nav>' if links else ""
+
+
+def _forecast_section(ctx: DashboardContext, step: pd.Timedelta) -> Section:
+    from prophet.dashboard._context import Section
+
+    figure = _forecast_figure(
+        ctx.go, ctx.m, ctx.fcst, ctx.uncertainty, step, ctx.breaks
+    )
+    body = (
+        ctx.embed(figure)
+        + '<p class="note">Hover for the date, value and interval. Click a legend entry to hide or show '
+        "it, drag to zoom and double-click to reset.</p>"
+    )
+    return Section("forecast", "Forecast", body)
+
+
+#: ``plot_components_plotly`` writes each panel's headline and sentence as a figure
+#: annotation, wrapped for the width it is given. An annotation cannot wrap to a
+#: phone and plotly clips it at the figure edge, so the page lifts that text into
+#: HTML and draws each panel as a figure of its own below it.
+_PANEL_LABEL = re.compile(
+    r"^<b>(?P<head>.*?)</b>(?:<br><span[^>]*>(?P<sub>.*)</span>)?$", re.S
+)
+_MARKUP_BREAK = re.compile(r"<br\s*/?>")
+_MARKUP_TAG = re.compile(r"<[^>]+>")
+#: Wide on purpose: the sentences are then never cut short, and the wrapping is left to the browser.
+_PANEL_FIGSIZE = (4000, 200)
+_PANEL_MARGIN = {"l": 70, "r": 24, "t": 16, "b": 40}
+
+
+def _plain_text(markup: str) -> str:
+    """Plotly's small HTML subset as plain text: line breaks become spaces, tags go, entities are decoded."""
+    text = html.unescape(_MARKUP_TAG.sub("", _MARKUP_BREAK.sub(" ", markup)))
+    return " ".join(text.split())
+
+
+def _panel_text(label: str) -> tuple[str, str]:
+    """Headline and sentence of a ``plot_components_plotly`` panel label, as plain text."""
+    found = _PANEL_LABEL.match(label)
+    if found is None:
+        return _plain_text(label), ""
+    return _plain_text(found["head"]), _plain_text(found["sub"] or "")
+
+
+def _panel_id(kind: str, k: int) -> str:
+    """Plotly's name for the axis of the k-th panel (1-based): ``x``, ``x2``, ``xaxis3`` and so on."""
+    return kind if k == 1 else f"{kind}{k}"
+
+
+def _panel_ref(ref: str | None, k: int) -> str | None:
+    """A shape or annotation reference (``x3``, ``y3 domain``) as panel k alone sees it; None if it points elsewhere."""
+    if ref is None:
+        return None
+    axis, _, rest = ref.partition(" ")
+    for kind in ("x", "y"):
+        if axis == _panel_id(kind, k):
+            return f"{kind} {rest}" if rest else kind
+    return None
+
+
+def _panel_figures(go: Any, combined: Any) -> list[tuple[str, str, Any]]:
+    """Split a ``plot_components_plotly`` figure into ``(headline, sentence, figure)``, one per panel.
+
+    Each figure keeps its panel's traces, axes, zone tints and zone labels. The
+    combined figure is only read.
+    """
+    layout = combined.layout
+    labels = [a.text for a in layout.annotations if a.xref == "paper"]
+    panels = []
+    for k, label in enumerate(labels, start=1):
+        xaxis = go.layout.XAxis(layout[_panel_id("xaxis", k)])
+        yaxis = go.layout.YAxis(layout[_panel_id("yaxis", k)])
+        for axis in (xaxis, yaxis):
+            axis.anchor = axis.domain = axis.matches = None
+        data = [
+            type(t)(t).update(xaxis="x", yaxis="y")
+            for t in combined.data
+            if (t.xaxis or "x") == _panel_id("x", k)
+        ]
+        shapes = [
+            go.layout.Shape(s).update(xref="x", yref=_panel_ref(s.yref, k) or s.yref)
+            for s in layout.shapes
+            if _panel_ref(s.xref, k)
+        ]
+        annotations = [
+            go.layout.Annotation(a).update(
+                xref="x", yref=_panel_ref(a.yref, k) or a.yref
+            )
+            for a in layout.annotations
+            if _panel_ref(a.xref, k)
+        ]
+        figure = go.Figure(
+            data=data,
+            layout=go.Layout(
+                autosize=True,
+                height=_PANEL_FIGSIZE[1] + _PANEL_MARGIN["t"] + _PANEL_MARGIN["b"],
+                showlegend=False,
+                paper_bgcolor=layout.paper_bgcolor,
+                plot_bgcolor=layout.plot_bgcolor,
+                font=layout.font,
+                margin=_PANEL_MARGIN,
+                xaxis=xaxis,
+                yaxis=yaxis,
+                shapes=shapes,
+                annotations=annotations,
+            ),
+        )
+        panels.append((*_panel_text(label), figure))
+    return panels
+
+
+def _components_section(
+    ctx: DashboardContext, covered: Collection[str] = ()
+) -> Section | None:
+    """The component panels, or None when nothing is left to draw.
+
+    ``covered`` names the panels (``"trend"``, ``"holidays"``) that a section
+    of their own draws in more detail; they are left out and a line says so.
+    """
+    from prophet.dashboard import panels
+    from prophet.dashboard._context import Section
+    from prophet.dashboard._style import h3, lede, note
+    from prophet.plot import plot_components_plotly
+
+    skip = ctx.skip
+    combined = plot_components_plotly(
+        ctx.m,
+        ctx.fcst,
+        uncertainty=ctx.uncertainty,
+        figsize=_PANEL_FIGSIZE,
+        title=False,
+        skip_days=None if skip is None else skip.skip_days,
+        skip_hours=None if skip is None else skip.skip_hours,
+    )
+    drawn, dropped = panels.refine(ctx, _panel_figures(ctx.go, combined), covered)
+    if not drawn:
+        return None
+    reason = panels.covered_note(dropped)
+    body = (lede(reason) if reason else "") + "".join(
+        h3(p.head) + (note(p.sentence) if p.sentence else "") + ctx.embed(p.figure)
+        for p in drawn
+    )
+    return Section("components", "Components", body)
+
+
+def _regressors_section(
+    ctx: DashboardContext,
+    runs_by_name: Mapping[str, Sequence[SourceRun]],
+    weather_regressor: str,
+    step: pd.Timedelta,
+) -> Section | None:
+    from prophet.dashboard._context import Section
+
+    m = ctx.m
+    if not m.extra_regressors:
+        return None
+    rows = _regressor_rows(m, ctx.fcst, ctx.units)
+    if not ctx.uncertainty:
+        rows = [_RegressorRow(r.effect, r.series, None, None) for r in rows]
+    phrase = ""
+    if runs_by_name:
+        hist_end = cast("pd.DataFrame", m.history)["ds"].max()
+        phrase = weather_source_phrase(
+            _runs_after(runs_by_name[weather_regressor], ctx.fcst["ds"], hist_end),
+            hist_end,
+            step,
+            calendar=ctx.skip is not None,
+        )
+    extra = f'<p class="note">{html.escape(phrase)}</p>' if phrase else ""
+    figure = _regressor_figure(
+        ctx.go, m, ctx.fcst, rows, runs_by_name, step, ctx.breaks
+    )
+    return Section(
+        "regressors",
+        "Extra regressors",
+        _cards_html(rows) + ctx.embed(figure) + extra,
+        _regressors_summary(rows),
+    )
+
+
+def _module_builder(key: str) -> Callable[[DashboardContext], Section | None]:
+    """The ``build`` function of the section module for ``key``, looked up when called."""
+    module = importlib.import_module(f"prophet.dashboard.{key}")
+    return cast("Callable[[DashboardContext], Section | None]", module.build)
+
+
+def _build_sections(
+    keys: Sequence[str],
+    ctx: DashboardContext,
+    own: Mapping[str, Callable[[DashboardContext], Section | None]],
+    after: Mapping[str, Callable[[DashboardContext, frozenset[str]], Section | None]]
+    | None = None,
+) -> list[Section]:
+    """Build the sections of ``keys``, returned in ``keys`` order; those that do not apply to the model are left out.
+
+    A builder in ``after`` runs once every other section is built and is told
+    which of them exist, so that it can leave out what they already show.
+    """
+    late = after or {}
+    built: dict[str, Section] = {}
+
+    def keep(key: str, section: Section | None) -> None:
+        if section is None:
+            logger.info(
+                "Dashboard section %r does not apply to this model; left out.", key
+            )
+            return
+        if section.key != key:
+            raise ValueError(
+                f"The {key!r} section came back with the key {section.key!r}."
+            )
+        built[key] = section
+
+    for key in keys:
+        if key not in late:
+            build = own[key] if key in own else _module_builder(key)
+            keep(key, build(ctx))
+    for key in keys:
+        if key in late:
+            keep(key, late[key](ctx, frozenset(built)))
+    return [built[key] for key in keys if key in built]
+
+
 def _page_html(
     *,
     title: str,
     subtitle: str,
     tiles: Sequence[Tile],
     metric_tiles: Sequence[Tile],
-    sections: Sequence[tuple[str, str]],
+    sections: Sequence[Section],
     footer: str,
     plotly_js: str,
+    theme: DashboardTheme = "light",
 ) -> str:
+    from prophet.dashboard import _assets
+
     body = [
         f'<div class="bar"></div><h1>{html.escape(title)}</h1><p class="sub">{html.escape(subtitle)}</p>',
         "<h2>At a glance</h2>",
@@ -3469,14 +3913,28 @@ def _page_html(
             "<h2>How well it works on held-back data</h2>",
             _tiles_html(metric_tiles),
         ]
-    body += [f"<h2>{html.escape(name)}</h2>{content}" for name, content in sections]
+    body.append(_findings_html(sections))
+    body += [
+        f'<section id="{html.escape(s.key)}"><h2>{html.escape(s.title)}</h2>{s.body}</section>'
+        for s in sections
+    ]
     body.append(f'<p class="foot">{html.escape(footer)}</p>')
+    initial = "" if theme == "auto" else f' data-theme="{theme}"'
+    pressed = "true" if theme == "dark" else "false"
+    css = _PAGE_CSS + (_AUTO_CSS if theme == "auto" else "") + _PRINT_CSS
     return (
-        '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
+        f'<!doctype html>\n<html lang="en"{initial} data-theme-default="{theme}"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"<title>{html.escape(title)}</title><style>{_PAGE_CSS}</style>"
-        f'<script type="text/javascript">{plotly_js}</script></head>'
-        f"<body><main>{''.join(body)}</main></body></html>\n"
+        f"<title>{html.escape(title)}</title><style>{css}</style>"
+        f"<script>{_assets.BOOT_SCRIPT}</script>"
+        f'<script type="text/javascript">{plotly_js}</script>'
+        f"<script>{_assets.PLOT_TRACKER}</script></head>"
+        '<body><a class="skip" href="#main">Skip to the content</a>'
+        f'<div class="topbar"><div class="topbar-in">{_nav_html(sections)}'
+        '<button type="button" class="btn" id="theme-toggle" aria-pressed="'
+        f'{pressed}" title="Switch between the light and dark theme">Dark theme</button></div></div>'
+        f'<main id="main">{"".join(body)}</main>'
+        f"<script>{_assets.theme_script(_palette.DARK_SWAP)}</script></body></html>\n"
     )
 
 
@@ -3495,13 +3953,33 @@ def dashboard_html(
     uncertainty: bool = True,
     skip_days: SkipSpec = None,
     skip_hours: SkipSpec = None,
+    sections: Sequence[str] | None = None,
+    theme: DashboardTheme = "light",
+    backtest: Backtest | None = None,
+    cv: pd.DataFrame | None = None,
 ) -> Path:
-    """Write a self-contained interactive page with the forecast, components and regressor effects.
+    """Write a self-contained interactive page about a fitted model and its forecast.
 
-    The plotly.js bundle is embedded, so the file works offline. Hover shows
-    the date, value and interval; clicking a legend entry hides or shows that
-    series (the interval band toggles with one click; the trend starts hidden).
-    Regressor effects appear when the model has extra regressors.
+    The plotly.js bundle is embedded, so the file works offline. The page has
+    key numbers and key findings at the top, a navigation bar and one block per
+    section. Hover shows the date, value and interval; clicking a legend entry
+    hides or shows that series; a button switches between the light and dark
+    theme and remembers the choice in the browser.
+
+    The sections, by the key that ``sections`` takes, in their default order:
+
+    * ``forecast``: the interactive forecast chart.
+    * ``accuracy``: backtest and cross-validation accuracy by horizon.
+    * ``components``: the seasonal curves and the regressor effects in panels,
+      worded from the weekdays and hours the data has. The trend and the
+      holidays are panels here only when their own sections are not shown.
+    * ``trend``: the trend with its changepoints and its rate of change.
+    * ``seasonality``: heatmaps and strength of the seasonal patterns.
+    * ``holidays``: the effect of each holiday and those in the forecast window.
+    * ``regressors``: what each extra regressor added to the forecast.
+    * ``diagnostics``: residuals of the fit on the training data.
+    * ``data``: data quality and the forecast table.
+    * ``settings``: the model settings in plain words.
 
     Parameters
     ----------
@@ -3509,8 +3987,9 @@ def dashboard_html(
     fcst: Output of ``m.predict``.
     path: Where to write the HTML file. Missing parent folders are created.
     title, subtitle: None writes them from the data.
-    df: The observed data, for the key numbers.
-    metrics: Backtest metrics to show as a second row of key numbers.
+    df: The observed data, for the key numbers and the data section.
+    metrics: Backtest metrics to show as a second row of key numbers. None
+        takes them from ``backtest`` when that is given.
     weather_sources, weather_regressor, units: As for :func:`plot_regressor_effects`.
     uncertainty: Draw intervals when the model has them.
     skip_days, skip_hours: Weekdays (names, numbers with Monday as 0, or
@@ -3518,6 +3997,18 @@ def dashboard_html(
         and ``df`` on them are left out and every time axis uses plotly
         ``rangebreaks`` to close the gap; the weekly profile shows only the
         remaining days.
+    sections: Keys of the sections to include, in the order to show them. None
+        includes every section that applies to the model, in the order below.
+        A section that does not apply (``"holidays"`` for a model without
+        holidays) is left out and logged at info level. Unknown or repeated
+        keys raise ValueError.
+    theme: The theme the page opens in: ``"light"``, ``"dark"`` or ``"auto"``
+        (follow the system setting, live, until the viewer picks one). A
+        choice the viewer made earlier in the same browser takes precedence.
+    backtest: A finished :func:`run_backtest`. Its metrics fill ``metrics`` and
+        the accuracy section draws it against the held-back data.
+    cv: Output of :func:`prophet.diagnostics.cross_validation`, for the
+        accuracy section's error by horizon.
 
     Returns
     -------
@@ -3526,101 +4017,75 @@ def dashboard_html(
     Raises
     ------
     ImportError: If plotly is not installed (``pip install plotly``).
+    ValueError: For an unknown ``theme``, unknown or repeated ``sections``, or
+        ``weather_sources`` for a model without extra regressors.
     """
+    from prophet.dashboard import SECTION_ORDER
+    from prophet.dashboard._context import build_context
+
+    _check_theme(theme)
+    keys = _resolve_sections(sections, SECTION_ORDER)
     go = _require_plotly()
     from plotly.offline import get_plotlyjs
 
-    from prophet.plot import plot_components_plotly
-
-    skip = _chart_axis(fcst["ds"], skip_days, skip_hours)
-    fcst, weather_sources = _without_skipped(fcst, weather_sources, skip)
-    if skip is not None and df is not None and "ds" in df:
-        df = df[skip.keeps(pd.to_datetime(df["ds"]))]
-    breaks = (
-        [] if skip is None else _plotly_rangebreaks(skip.skip_days, skip.skip_hours)
-    )
-    summary = _summarise(m, fcst, df)
-    auto_title, auto_sub = _report_headline(m, summary, skip)
-    sections: list[tuple[str, str]] = []
-    config = {"displaylogo": False, "responsive": True}
-
-    def embed(fig: Any) -> str:
-        return cast(
-            "str", fig.to_html(full_html=False, include_plotlyjs=False, config=config)
-        )
-
-    sections.append(
-        (
-            "The forecast",
-            embed(_forecast_figure(go, m, fcst, uncertainty, summary.step, breaks))
-            + '<p class="note">Hover for the date, value and interval. Click a legend entry to hide or show '
-            "it, drag to zoom and double-click to reset.</p>",
-        )
-    )
-    components = plot_components_plotly(
-        m,
-        fcst,
-        uncertainty=uncertainty,
-        title=False,
-        skip_days=None if skip is None else skip.skip_days,
-        skip_hours=None if skip is None else skip.skip_hours,
-    )
-    components.update_layout(autosize=True, width=None)
-    sections.append(("What shapes it", embed(components)))
-    runs_by_name: dict[str, tuple[SourceRun, ...]] = {}
-    if m.extra_regressors:
-        rows = _regressor_rows(m, fcst, units)
-        if not uncertainty:
-            rows = [_RegressorRow(r.effect, r.series, None, None) for r in rows]
-        runs_by_name = _weather_runs_for(m, fcst, weather_sources, weather_regressor)
-        phrase = ""
-        if runs_by_name:
-            hist_end = cast("pd.DataFrame", m.history)["ds"].max()
-            phrase = weather_source_phrase(
-                _runs_after(runs_by_name[weather_regressor], fcst["ds"], hist_end),
-                hist_end,
-                summary.step,
-                calendar=skip is not None,
-            )
-        extra = f'<p class="note">{html.escape(phrase)}</p>' if phrase else ""
-        sections.append(
-            (
-                "Extra regressors",
-                _cards_html(rows)
-                + embed(
-                    _regressor_figure(
-                        go, m, fcst, rows, runs_by_name, summary.step, breaks
-                    )
-                )
-                + extra,
-            )
-        )
-    elif weather_sources is not None:
+    if weather_sources is not None and not m.extra_regressors:
         raise ValueError(
             "weather_sources was given but the model has no extra regressors."
         )
-
+    if metrics is None and backtest is not None:
+        metrics = backtest.metrics
+    skip = _chart_axis(fcst["ds"], skip_days, skip_hours)
+    fcst, weather_sources = _without_skipped(fcst, weather_sources, skip)
+    fcst, weather_sources = _sorted_by_date(fcst, weather_sources)
+    if skip is not None and df is not None and "ds" in df:
+        df = df[skip.keeps(pd.to_datetime(df["ds"]))]
+    ctx = build_context(
+        m,
+        fcst,
+        df=df,
+        skip=skip,
+        uncertainty=uncertainty,
+        backtest=backtest,
+        cv=cv,
+        units=units,
+        go=go,
+    )
+    summary = _summarise(m, ctx.fcst, df)
+    auto_title, auto_sub = _report_headline(m, summary, skip)
+    runs_by_name = _weather_runs_for(m, ctx.fcst, weather_sources, weather_regressor)
+    own: dict[str, Callable[[DashboardContext], Section | None]] = {
+        "forecast": lambda c: _forecast_section(c, summary.step),
+        "regressors": lambda c: _regressors_section(
+            c, runs_by_name, weather_regressor, summary.step
+        ),
+    }
+    after: dict[str, Callable[[DashboardContext, frozenset[str]], Section | None]] = {
+        "components": lambda c, present: _components_section(
+            c, covered=present & {"trend", "holidays"}
+        ),
+    }
+    built = _build_sections(keys, ctx, own, after)
+    hist_end = cast("pd.DataFrame", m.history)["ds"].max()
     page = _page_html(
         title=title if title is not None else auto_title,
         subtitle=subtitle if subtitle is not None else auto_sub,
         tiles=_summary_tiles(summary, skip),
         metric_tiles=_metric_tiles(metrics) if metrics else [],
-        sections=sections,
+        sections=built,
         footer=_join_sentences(
             f"NeoProphet forecast dashboard: {_summary_phrase(m)}",
             None if skip is None else _skip_note(skip),
             weather_ahead_note(
                 _runs_after(
-                    runs_by_name.get(weather_regressor, ()),
-                    fcst["ds"],
-                    cast("pd.DataFrame", m.history)["ds"].max(),
+                    runs_by_name.get(weather_regressor, ()), ctx.fcst["ds"], hist_end
                 ),
-                cast("pd.DataFrame", m.history)["ds"].max(),
+                hist_end,
                 summary.step,
                 calendar=skip is not None,
             ),
         ),
         plotly_js=get_plotlyjs(),
+        theme=theme,
     )
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)

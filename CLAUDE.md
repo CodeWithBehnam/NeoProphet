@@ -29,7 +29,8 @@ python/
     tuning_optuna.py    # Optuna glue for tune(search="optuna"), lazily imported; extra neoprophet[optuna]
     mlx_backend.py      # Experimental MLX backend (MAP only) and batched fit_many()
     weather.py          # Open-Meteo temperature (archive, forecast, climatology) with disk cache; tests never hit the network
-    visuals.py          # Backtest, regressor effects, one-page report, offline HTML dashboard
+    visuals.py          # Backtest, regressor effects, one-page report, offline HTML dashboard (page shell, forecast, components, regressors)
+    dashboard/          # Dashboard sections built by visuals.dashboard_html: one module per section (accuracy, trend, seasonality, holidays, diagnostics, data, settings) plus _context, _style, _palette and _assets
     tests/              # pytest suite
   stan/
     prophet.stan        # The Stan model (logistic + linear trend)

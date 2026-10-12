@@ -343,6 +343,32 @@ def test_regressor_effects_describe_each_regressor() -> None:
     assert "when promo is on" in effects["promo"].sentence
 
 
+def test_regressors_are_ranked_in_the_units_of_y_whatever_their_mode() -> None:
+    # x is additive and moves y by about 0.6; z is multiplicative and moves it by
+    # 20% of a trend near 40, which is about 8. Ranked on the raw numbers z (0.2)
+    # would sit below x (0.6).
+    m, _, fcst = fit_case("regressors")
+    assert fcst["x"].abs().max() > fcst["z"].abs().max()
+    assert (fcst["z"].abs() * fcst["trend"]).max() > 10 * fcst["x"].abs().max()
+    assert [e.name for e in regressor_effects(m, fcst)] == ["z", "x"]
+
+
+def test_the_reach_of_a_regressor_is_scaled_by_the_trend_only_when_multiplicative() -> (
+    None
+):
+    fcst = pd.DataFrame(
+        {"trend": [10.0, 20.0, 40.0], "r": [0.5, -0.25, 0.1], "ds": [1, 2, 3]}
+    )
+    assert visuals._reach_in_y(Prophet(), fcst, "r", "additive") == 0.5
+    assert visuals._reach_in_y(Prophet(), fcst, "r", "multiplicative") == 5.0
+    assert (
+        visuals._reach_in_y(
+            Prophet(), fcst.assign(r=[np.nan] * 3), "r", "multiplicative"
+        )
+        == 0.0
+    )
+
+
 # ---- pure: weather sources ---------------------------------------------------
 
 
@@ -647,6 +673,72 @@ def test_report_summary_numbers_come_from_the_data() -> None:
     assert tiles["HORIZON"].value == "4 weeks"
 
 
+def test_the_observed_range_is_part_of_the_report_summary() -> None:
+    m, df, fcst = fit_case("linear")
+    summary = visuals._summarise(m, fcst, df)
+    assert summary.y_min == pytest.approx(df["y"].min())
+    assert summary.y_max == pytest.approx(df["y"].max())
+
+
+def summary_with(mean: float | None, low: float = 25.0, high: float = 72.0) -> Any:
+    ds = pd.Timestamp("2024-01-31")
+    return visuals._Summary(
+        n_obs=31,
+        start=pd.Timestamp("2024-01-01"),
+        end=ds,
+        step=pd.Timedelta(days=1),
+        last_value=40.0,
+        n_future=28,
+        future_end=ds + pd.Timedelta(days=28),
+        forecast_mean=mean,
+        recent_mean=40.0,
+        window=pd.Timedelta(days=28),
+        scale=72.0,
+        y_min=low,
+        y_max=high,
+    )
+
+
+def test_a_forecast_average_far_outside_the_data_is_flagged_in_the_headline() -> None:
+    low = visuals._range_warning(summary_with(-8.18))
+    assert low == (
+        "That average is below every value in the history (the lowest is 25), "
+        "so check the model before relying on the forecast."
+    )
+    high = visuals._range_warning(summary_with(120.0))
+    assert high.startswith(
+        "That average is above every value in the history (the highest is 72)"
+    )
+    # Inside the range, or only a little outside it, a trend can explain the average.
+    assert visuals._range_warning(summary_with(50.0)) == ""
+    assert visuals._range_warning(summary_with(20.0)) == ""
+    assert visuals._range_warning(summary_with(80.0)) == ""
+    assert visuals._range_warning(summary_with(None)) == ""
+    assert visuals._range_warning(summary_with(10.0, low=float("nan"))) == ""
+    # Data that never goes below zero cannot average below it.
+    assert visuals._range_warning(summary_with(-1.0, low=0.0, high=100.0)) != ""
+    assert visuals._range_warning(summary_with(-1.0, low=-50.0, high=100.0)) == ""
+    m, _, _ = fit_case("linear")
+    _, sub = visuals._report_headline(m, summary_with(-8.18))
+    assert (
+        "The forecast averages -8.18 over the next 4 weeks. That average is below"
+        in sub
+    )
+    _, quiet = visuals._report_headline(m, summary_with(50.0))
+    assert "check the model" not in quiet
+
+
+def test_dates_in_prose_do_not_carry_a_leading_zero() -> None:
+    day = pd.Timedelta(days=1)
+    stamp = pd.Timestamp("2014-03-05 09:05")
+    assert visuals._fmt_day(stamp, day) == "5 Mar 2014"
+    assert visuals._fmt_day(stamp, pd.Timedelta(minutes=5)) == "5 Mar 2014 09:05"
+    assert visuals._fmt_date(stamp, pd.Timedelta(days=100)) == "5 Mar 2014"
+    assert visuals._fmt_date(stamp, pd.Timedelta(days=3)) == "5 Mar 09:05"
+    assert visuals._fmt_date(stamp, pd.Timedelta(days=900)) == "Mar 2014"
+    assert visuals._day_month(pd.Timestamp("2014-12-25")) == "25 Dec"
+
+
 def test_report_without_a_forecast_says_so() -> None:
     m, df, fcst = fit_case("linear")
     in_sample = fcst[fcst["ds"] <= df["ds"].max()]
@@ -703,9 +795,9 @@ def test_dashboard_html(case: str, tmp_path: Path) -> None:
     )  # the bundle is embedded
     assert '<script src="' not in page  # nothing is fetched from a CDN
     assert "<title>Forecast report: " in page
-    for heading in ("The forecast", "What shapes it", "At a glance"):
+    for heading in ("Forecast", "Components", "At a glance"):
         assert f">{heading}<" in page
-    assert ("Extra regressors" in page) == (case == "temperature")
+    assert ("<h2>Extra regressors</h2>" in page) == (case == "temperature")
     if case == "temperature":
         assert "+3" in page or "per °C" in page
         assert "Ahead, it comes from the weather forecast for 9 days" in page

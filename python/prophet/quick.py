@@ -1387,15 +1387,19 @@ class ForecastResult:
         """Write the interactive HTML dashboard and return its path.
 
         Needs plotly (``pip install plotly``).  ``backtest`` and ``horizon``
-        work as in :meth:`report`; other kwargs go to
-        :func:`prophet.visuals.dashboard_html`.
+        work as in :meth:`report`; the backtest feeds both the accuracy numbers
+        at the top of the page and the accuracy section's chart.  Other kwargs
+        go to :func:`prophet.visuals.dashboard_html`, for example ``sections``
+        to choose and order the sections, ``theme`` (``"light"``, ``"dark"`` or
+        ``"auto"``) and ``cv`` with the output of
+        :func:`prophet.diagnostics.cross_validation`.
         """
         from prophet.visuals import dashboard_html
 
         run = self._resolve_backtest(backtest, horizon)
         style: dict[str, Any] = {
             "df": self.history,
-            "metrics": None if run is None else run.metrics,
+            "backtest": run,
             **self._skip_kwargs(),
             **self._weather_kwargs(),
             **kwargs,

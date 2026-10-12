@@ -142,7 +142,23 @@ result.report().savefig("forecast-report.pdf")   # one page: forecast, component
 result.dashboard("forecast.html")                # interactive, self-contained, works offline
 ```
 
-The same functions are available for any fitted model in `prophet.visuals`.
+The dashboard needs plotly (`pip install plotly`). Beyond the forecast chart it holds a backtest and cross-validation accuracy by horizon, the trend with its changepoints and pace, seasonal heatmaps and strength, the effect of each holiday and regressor, residual diagnostics, data-quality checks with a downloadable forecast table, and the model settings in plain words with code to recreate the model. Choose and order the sections with `sections=`, and set the opening theme with `theme=`:
+
+```python
+from prophet.diagnostics import cross_validation
+
+cv = cross_validation(result.model, initial="730 days", period="90 days", horizon="30 days")
+result.dashboard(
+    "forecast.html",
+    theme="auto",                                       # "light", "dark" or "auto" (follow the system)
+    sections=["forecast", "accuracy", "trend", "diagnostics", "settings"],
+    cv=cv,                                              # adds error by horizon to the accuracy section
+)
+```
+
+The keys, in their default order, are `forecast`, `accuracy`, `components`, `trend`, `seasonality`, `holidays`, `regressors`, `diagnostics`, `data` and `settings`. A section that does not apply, such as `holidays` for a model without any, is left out and logged at info level. A button on the page switches between the light and dark theme and remembers the choice in the browser. Skipped days and hours close up on every time axis.
+
+The same functions are available for any fitted model in `prophet.visuals` (`dashboard_html(m, fcst, path, df=df, ...)`).
 
 ### Many series on an Apple Silicon GPU (experimental)
 
@@ -264,7 +280,8 @@ python/
     tuning.py           # tune(): parallel cross-validated hyperparameter search
     tuning_optuna.py    # Optuna search behind tune(search="optuna"), optional extra
     plot.py             # Default chart style (matplotlib and plotly), gap-free skip_axis()
-    visuals.py          # Backtest, regressor effects, one-page report, HTML dashboard
+    visuals.py          # Backtest, regressor effects, one-page report, HTML dashboard page and forecast section
+    dashboard/          # Dashboard sections (accuracy, trend, seasonality, holidays, diagnostics, data, settings), shared style and palette
     weather.py          # Open-Meteo temperature: archive, forecast, climatology
     forecaster.py       # Core Prophet class: fit(), predict()
     models.py           # CmdStanPy backend (shells out to the Stan binary)
